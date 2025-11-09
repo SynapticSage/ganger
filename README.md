@@ -1,4 +1,5 @@
-# Ganger - GitHub Ranger
+<img src=assets/logo.png width=50%>
+<!-- # Ganger - GitHub Ranger -->
 
 **Created**: 2025-11-07
 **Version**: 0.1.0
