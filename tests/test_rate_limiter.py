@@ -119,3 +119,43 @@ class TestRateLimiter:
 
         assert limiter.QUOTA_COSTS["list_starred"] == 1
         assert limiter.QUOTA_COSTS["search"] == 10
+
+    def test_wait_if_needed_when_exhausted(self, monkeypatch, capsys):
+        """Test wait_if_needed blocks and resets when quota exhausted."""
+        limiter = RateLimiter(buffer=0)
+
+        # Exhaust quota
+        limiter.quota_used = 5000
+        limiter.reset_time = datetime.now() + timedelta(seconds=3)
+
+        # Mock time.sleep to avoid actual waiting
+        sleep_calls = []
+        monkeypatch.setattr(time, "sleep", lambda x: sleep_calls.append(x))
+
+        # Execute wait
+        limiter.wait_if_needed()
+
+        # Verify sleep was called (duration may vary due to timing)
+        assert len(sleep_calls) == 1
+        assert sleep_calls[0] > 0  # Should wait some positive amount
+        assert sleep_calls[0] <= 4  # Upper bound with margin
+
+        # Verify quota was reset
+        assert limiter.quota_used == 0
+        assert limiter.reset_time is None
+
+        # Verify warning message was printed
+        captured = capsys.readouterr()
+        assert "Rate limit exceeded" in captured.out
+        assert "Waiting" in captured.out
+
+    def test_wait_if_needed_no_wait(self):
+        """Test wait_if_needed doesn't block when quota available."""
+        limiter = RateLimiter()
+        limiter.quota_used = 100
+
+        # Should not block (this test will hang if it fails)
+        limiter.wait_if_needed()
+
+        # Verify quota wasn't reset (still has original value)
+        assert limiter.quota_used == 100

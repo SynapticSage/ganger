@@ -240,3 +240,136 @@ class TestRateLimiting:
         client.rate_limiter.quota_used = 4950  # Near limit
 
         assert client.rate_limiter.should_warn()
+
+
+class TestErrorHandling:
+    """Test error handling in GitHub API client."""
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_list_starred_with_max_count(self, mock_ghapi, mock_auth, mock_repo):
+        """Test listing starred repos with max_count limit (line 87)."""
+        # Create 5 repos but limit to 2
+        mock_user = Mock()
+        mock_user.get_starred.return_value = [mock_repo for _ in range(5)]
+        mock_auth.get_github_client.return_value.get_user.return_value = mock_user
+
+        client = GitHubAPIClient(mock_auth)
+        repos = client._get_starred_rest(max_count=2)
+
+        assert len(repos) == 2
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_list_starred_auth_error(self, mock_ghapi, mock_auth):
+        """Test 401 auth error raises AuthenticationError (lines 104-110)."""
+        from github import GithubException
+
+        mock_auth.get_github_client.return_value.get_user.side_effect = GithubException(
+            401, {"message": "Bad credentials"}
+        )
+
+        client = GitHubAPIClient(mock_auth)
+
+        with pytest.raises(AuthenticationError, match="authentication failed"):
+            client._get_starred_rest()
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_list_starred_rate_limit_error(self, mock_ghapi, mock_auth):
+        """Test 403 rate limit error raises RateLimitExceededError (lines 104-110)."""
+        from github import GithubException
+
+        error_data = {"message": "API rate limit exceeded"}
+        mock_auth.get_github_client.return_value.get_user.side_effect = GithubException(
+            403, error_data
+        )
+
+        client = GitHubAPIClient(mock_auth)
+
+        with pytest.raises(RateLimitExceededError, match="API rate limit exceeded"):
+            client._get_starred_rest()
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_list_starred_generic_error(self, mock_ghapi, mock_auth):
+        """Test generic GitHub error raises GangerError (line 110)."""
+        from github import GithubException
+        from ganger.core.exceptions import GangerError
+
+        mock_auth.get_github_client.return_value.get_user.side_effect = GithubException(
+            500, {"message": "Internal Server Error"}
+        )
+
+        client = GitHubAPIClient(mock_auth)
+
+        with pytest.raises(GangerError, match="GitHub API error"):
+            client._get_starred_rest()
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_star_repo_not_found(self, mock_ghapi, mock_auth):
+        """Test starring nonexistent repo raises RepoNotFoundError (lines 281-284)."""
+        from github import GithubException
+
+        mock_auth.get_github_client.return_value.get_repo.side_effect = GithubException(
+            404, {"message": "Not Found"}
+        )
+
+        client = GitHubAPIClient(mock_auth)
+
+        with pytest.raises(RepoNotFoundError, match="Repository.*not found"):
+            client.star_repo("invalid/repo")
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_unstar_repo_not_found(self, mock_ghapi, mock_auth):
+        """Test unstarring nonexistent repo raises RepoNotFoundError (lines 303-306)."""
+        from github import GithubException
+
+        mock_auth.get_github_client.return_value.get_repo.side_effect = GithubException(
+            404, {"message": "Not Found"}
+        )
+
+        client = GitHubAPIClient(mock_auth)
+
+        with pytest.raises(RepoNotFoundError, match="Repository.*not found"):
+            client.unstar_repo("invalid/repo")
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_get_readme_repo_not_found(self, mock_ghapi, mock_auth):
+        """Test getting README for nonexistent repo (lines 359-362)."""
+        from github import GithubException
+
+        mock_auth.get_github_client.return_value.get_repo.side_effect = GithubException(
+            404, {"message": "Not Found"}
+        )
+
+        client = GitHubAPIClient(mock_auth)
+
+        with pytest.raises(RepoNotFoundError, match="Repository.*not found"):
+            client.get_readme("invalid/repo")
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_search_repos_rate_limit(self, mock_ghapi, mock_auth):
+        """Test search with rate limit error (lines 393-396)."""
+        from github import GithubException
+
+        error_data = {"message": "API rate limit exceeded for search"}
+        mock_auth.get_github_client.return_value.search_repositories.side_effect = GithubException(
+            403, error_data
+        )
+
+        client = GitHubAPIClient(mock_auth)
+
+        with pytest.raises(RateLimitExceededError, match="rate limit"):
+            client.search_repos("python")
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_search_repos_generic_error(self, mock_ghapi, mock_auth):
+        """Test search with generic error (line 396)."""
+        from github import GithubException
+        from ganger.core.exceptions import GangerError
+
+        mock_auth.get_github_client.return_value.search_repositories.side_effect = GithubException(
+            401, {"message": "Unauthorized"}
+        )
+
+        client = GitHubAPIClient(mock_auth)
+
+        with pytest.raises(GangerError, match="Search error"):
+            client.search_repos("python")
