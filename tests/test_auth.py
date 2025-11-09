@@ -286,3 +286,246 @@ class TestGitHubAuth:
 
         expected_path = Path.home() / ".config" / "ganger" / "token.json"
         assert auth.token_file == expected_path
+
+
+class TestOAuthDeviceFlow:
+    """Test OAuth device flow authentication."""
+
+    @patch("httpx.post")
+    @patch("webbrowser.open")
+    @patch("time.sleep")
+    @patch("ganger.core.auth.Github")
+    def test_oauth_device_flow_success(self, mock_github_class, mock_sleep, mock_browser, mock_post, tmp_path):
+        """Test successful OAuth device flow (lines 184-267)."""
+        token_file = tmp_path / "token.json"
+
+        # Mock device code request
+        device_response = Mock()
+        device_response.json.return_value = {
+            "device_code": "ABC123",
+            "user_code": "WXYZ-1234",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 5
+        }
+
+        # Mock token polling (first pending, then success)
+        token_pending = Mock()
+        token_pending.json.return_value = {"error": "authorization_pending"}
+
+        token_success = Mock()
+        token_success.json.return_value = {
+            "access_token": "gho_test_token_123",
+            "token_type": "bearer",
+            "scope": "repo user"
+        }
+
+        mock_post.side_effect = [device_response, token_pending, token_success]
+
+        # Mock GitHub client for verification
+        mock_user = Mock()
+        mock_user.login = "testuser"
+        mock_github_instance = Mock()
+        mock_github_instance.get_user.return_value = mock_user
+        mock_github_class.return_value = mock_github_instance
+
+        auth = GitHubAuth(token_file=token_file, auth_method="oauth")
+        auth._oauth_device_flow()
+
+        assert auth._token is not None
+        assert auth.get_token() == "gho_test_token_123"
+        mock_browser.assert_called_once()
+
+    @patch("httpx.post")
+    @patch("webbrowser.open")
+    @patch("time.sleep")
+    def test_oauth_device_flow_expired(self, mock_sleep, mock_browser, mock_post, tmp_path):
+        """Test OAuth flow with expired token (lines 251-252)."""
+        token_file = tmp_path / "token.json"
+
+        # Mock device code request
+        device_response = Mock()
+        device_response.json.return_value = {
+            "device_code": "ABC123",
+            "user_code": "WXYZ-1234",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 5
+        }
+
+        # Mock token expired response
+        token_expired = Mock()
+        token_expired.json.return_value = {"error": "expired_token"}
+
+        mock_post.side_effect = [device_response, token_expired]
+
+        auth = GitHubAuth(token_file=token_file, auth_method="oauth")
+
+        with pytest.raises(AuthenticationError, match="expired"):
+            auth._oauth_device_flow()
+
+    @patch("httpx.post")
+    @patch("webbrowser.open")
+    @patch("time.sleep")
+    def test_oauth_device_flow_denied(self, mock_sleep, mock_browser, mock_post, tmp_path):
+        """Test OAuth flow with user denial (lines 253-254)."""
+        token_file = tmp_path / "token.json"
+
+        # Mock device code request
+        device_response = Mock()
+        device_response.json.return_value = {
+            "device_code": "ABC123",
+            "user_code": "WXYZ-1234",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 5
+        }
+
+        # Mock access denied response
+        token_denied = Mock()
+        token_denied.json.return_value = {"error": "access_denied"}
+
+        mock_post.side_effect = [device_response, token_denied]
+
+        auth = GitHubAuth(token_file=token_file, auth_method="oauth")
+
+        with pytest.raises(AuthenticationError, match="denied"):
+            auth._oauth_device_flow()
+
+    @patch("httpx.post")
+    @patch("webbrowser.open")
+    @patch("time.sleep")
+    def test_oauth_device_flow_slow_down(self, mock_sleep, mock_browser, mock_post, tmp_path):
+        """Test OAuth flow with slow_down response (lines 247-250)."""
+        token_file = tmp_path / "token.json"
+
+        # Mock device code request
+        device_response = Mock()
+        device_response.json.return_value = {
+            "device_code": "ABC123",
+            "user_code": "WXYZ-1234",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 900,
+            "interval": 5
+        }
+
+        # Mock slow_down then success
+        token_slow_down = Mock()
+        token_slow_down.json.return_value = {"error": "slow_down"}
+
+        token_success = Mock()
+        token_success.json.return_value = {
+            "access_token": "gho_test_token",
+            "token_type": "bearer"
+        }
+
+        mock_post.side_effect = [device_response, token_slow_down, token_success]
+
+        # Mock GitHub client
+        with patch("ganger.core.auth.Github") as mock_github_class:
+            mock_user = Mock()
+            mock_user.login = "testuser"
+            mock_github_instance = Mock()
+            mock_github_instance.get_user.return_value = mock_user
+            mock_github_class.return_value = mock_github_instance
+
+            auth = GitHubAuth(token_file=token_file, auth_method="oauth")
+            auth._oauth_device_flow()
+
+            # Verify slow_down was handled (interval increased)
+            assert auth._token is not None
+
+    @patch("httpx.post")
+    def test_oauth_device_flow_request_error(self, mock_post, tmp_path):
+        """Test OAuth flow with device code request error (lines 196-197)."""
+        token_file = tmp_path / "token.json"
+
+        # Mock device code request failure
+        mock_post.side_effect = Exception("Network error")
+
+        auth = GitHubAuth(token_file=token_file, auth_method="oauth")
+
+        with pytest.raises(AuthenticationError, match="Failed to request device code"):
+            auth._oauth_device_flow()
+
+    @patch("httpx.post")
+    @patch("webbrowser.open")
+    @patch("time.sleep")
+    @patch("time.time")
+    def test_oauth_device_flow_timeout(self, mock_time, mock_sleep, mock_browser, mock_post, tmp_path):
+        """Test OAuth flow timeout (line 274)."""
+        token_file = tmp_path / "token.json"
+
+        # Mock device code request
+        device_response = Mock()
+        device_response.json.return_value = {
+            "device_code": "ABC123",
+            "user_code": "WXYZ-1234",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": 10,  # Short timeout
+            "interval": 5
+        }
+
+        # Mock token polling (always pending)
+        token_pending = Mock()
+        token_pending.json.return_value = {"error": "authorization_pending"}
+
+        mock_post.side_effect = [device_response] + [token_pending] * 10
+
+        # Mock time to simulate timeout
+        mock_time.side_effect = [0, 0, 15]  # Start, loop check, timeout
+
+        auth = GitHubAuth(token_file=token_file, auth_method="oauth")
+
+        with pytest.raises(AuthenticationError, match="timed out"):
+            auth._oauth_device_flow()
+
+
+class TestPATPrompt:
+    """Test Personal Access Token prompt authentication."""
+
+    @patch("getpass.getpass")
+    @patch("ganger.core.auth.Github")
+    def test_prompt_for_pat_success(self, mock_github_class, mock_getpass, tmp_path):
+        """Test PAT prompt with valid token (lines 283-302)."""
+        token_file = tmp_path / "token.json"
+        mock_getpass.return_value = "ghp_valid_token_123"
+
+        # Mock GitHub client for verification
+        mock_user = Mock()
+        mock_user.login = "testuser"
+        mock_github_instance = Mock()
+        mock_github_instance.get_user.return_value = mock_user
+        mock_github_class.return_value = mock_github_instance
+
+        auth = GitHubAuth(token_file=token_file)
+        auth._prompt_for_pat()
+
+        assert auth._token is not None
+        assert auth.get_token() == "ghp_valid_token_123"
+
+    @patch("getpass.getpass")
+    def test_prompt_for_pat_empty(self, mock_getpass, tmp_path):
+        """Test PAT prompt with empty input (lines 294-295)."""
+        token_file = tmp_path / "token.json"
+        mock_getpass.return_value = ""
+
+        auth = GitHubAuth(token_file=token_file)
+
+        with pytest.raises(AuthenticationError, match="No token provided"):
+            auth._prompt_for_pat()
+
+    @patch("getpass.getpass")
+    @patch("ganger.core.auth.Github")
+    def test_prompt_for_pat_invalid(self, mock_github_class, mock_getpass, tmp_path):
+        """Test PAT prompt with invalid token (lines 303-304)."""
+        token_file = tmp_path / "token.json"
+        mock_getpass.return_value = "invalid_token"
+
+        # Mock GitHub client to fail verification
+        mock_github_class.side_effect = Exception("Bad credentials")
+
+        auth = GitHubAuth(token_file=token_file)
+
+        with pytest.raises(AuthenticationError, match="Invalid token"):
+            auth._prompt_for_pat()
