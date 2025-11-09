@@ -1,0 +1,68 @@
+# Ganger Configuration
+# Modified: 2025-11-07
+
+github:
+  # Authentication method: 'oauth' or 'pat' (Personal Access Token)
+  auth_method: oauth
+
+  # For PAT auth: set GITHUB_TOKEN environment variable
+  # or uncomment and set here (not recommended for security)
+  # token: your_token_here
+
+  # Cache settings
+  cache_enabled: true
+  cache_ttl: 3600  # 1 hour in seconds
+
+  # Rate limiting
+  rate_limit_buffer: 100  # Reserve 100 requests before hitting limit
+
+cache:
+  # Cache database location
+  db_path: "~/.cache/ganger/ganger.db"
+
+  # TTL for different types of cached data
+  repos_ttl: 3600       # 1 hour
+  metadata_ttl: 86400   # 24 hours
+  readme_ttl: 604800    # 7 days
+
+folders:
+  # Default virtual folders with auto-categorization tags
+  default_folders:
+    - name: "Python Projects"
+      auto_tags: ["python", "py"]
+
+    - name: "JavaScript/TypeScript"
+      auto_tags: ["javascript", "typescript", "js", "ts", "nodejs"]
+
+    - name: "AI/ML"
+      auto_tags: ["machine-learning", "ai", "deep-learning", "ml", "artificial-intelligence"]
+
+    - name: "DevOps"
+      auto_tags: ["docker", "kubernetes", "ci-cd", "devops", "terraform"]
+
+    - name: "Web Development"
+      auto_tags: ["web", "frontend", "backend", "fullstack"]
+
+behavior:
+  # Confirm before unstarring
+  confirm_unstar: true
+
+  # Auto-refresh cache on startup
+  auto_refresh: false
+
+  # Default sort order: stars, updated, created, name, language
+  sort_order: stars
+
+  # Auto-categorize new repos into folders
+  auto_categorize: true
+
+# MCP server settings
+mcp:
+  # Server name for MCP client configuration
+  name: "ganger"
+
+  # Enable session state (clipboard, undo history)
+  enable_session_state: true
+
+  # Max undo history items
+  max_history: 50

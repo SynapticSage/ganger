@@ -1,0 +1,82 @@
+/* Ganger Theme */
+/* Modified: 2025-11-08 */
+
+Screen {
+    background: $surface;
+}
+
+/* Global Input widget styles to ensure text visibility */
+Input {
+    color: white !important;
+    background: black !important;
+    text-style: not dim !important;
+}
+
+Input:focus {
+    color: white !important;
+    background: rgb(20, 20, 20) !important;
+    text-style: not dim !important;
+}
+
+/* Force all internal Input elements to be visible */
+Input * {
+    color: white !important;
+}
+
+Input > .input--placeholder {
+    color: gray !important;
+}
+
+Input > .input--cursor {
+    color: white !important;
+    background: white !important;
+}
+
+Input .input--suggestion {
+    color: darkgray !important;
+}
+
+#main-container {
+    width: 100%;
+    height: 1fr;
+    background: $surface;
+}
+
+#loading-message {
+    width: 100%;
+    height: 100%;
+    content-align: center middle;
+    text-style: italic;
+    color: $text-muted;
+}
+
+#miller-view {
+    width: 100%;
+    height: 100%;
+}
+
+#status-bar {
+    height: 1;
+    dock: bottom;
+}
+
+#search-input {
+    dock: top;
+    height: 3;
+}
+
+#command-input {
+    dock: bottom;
+    height: 3;
+}
+
+/* Focus styles for columns */
+.focused {
+    border: solid $primary;
+}
+
+/* Loading indicator */
+LoadingIndicator {
+    content-align: center middle;
+    color: $primary;
+}

@@ -1,0 +1,78 @@
+[tool.poetry]
+name = "ganger"
+version = "0.1.0"
+description = "GitHub Ranger - Terminal-based file manager for GitHub starred repositories with TUI and MCP interfaces"
+authors = ["Ryan Young"]
+readme = "README.md"
+license = "MIT"
+packages = [{include = "ganger", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+# GitHub API clients
+PyGithub = "^2.1.1"
+ghapi = "^1.0.4"
+# MCP server
+mcp = "^0.9.0"
+# TUI framework (for Phase 2, but included now)
+textual = "^0.47.0"
+rich = "^13.7.0"
+# CLI framework
+click = "^8.1.7"
+# Configuration and data
+PyYAML = "^6.0.1"
+python-dotenv = "^1.0.0"
+# Caching and async
+aiosqlite = "^0.19.0"
+# Date handling
+python-dateutil = "^2.8.2"
+# HTTP client
+httpx = "^0.25.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.3"
+pytest-asyncio = "^0.21.1"
+pytest-cov = "^4.1.0"
+pytest-mock = "^3.12.0"
+black = "^23.12.1"
+ruff = "^0.1.9"
+mypy = "^1.8.0"
+types-PyYAML = "^6.0.12"
+
+[tool.poetry.scripts]
+ganger = "ganger.cli:cli"
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --cov=ganger --cov-report=term-missing"
+markers = [
+    "unit: Unit tests (fast, no I/O)",
+    "integration: Integration tests (database, API mocking)",
+    "slow: Tests that take >1s",
+    "graphql: GraphQL-specific tests",
+    "auth: Authentication tests",
+    "cache: Cache layer tests",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
