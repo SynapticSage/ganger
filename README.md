@@ -28,7 +28,7 @@ A terminal-based file manager for GitHub starred repositories, inspired by range
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/ganger.git
+git clone https://github.com/synapticsage/ganger.git
 cd ganger
 
 # Install dependencies

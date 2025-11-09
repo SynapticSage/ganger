@@ -1,10 +1,10 @@
 """
 Tests for core data models.
 
-Modified: 2025-11-07
+Modified: 2025-11-09
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import json
 import pytest
 from ganger.core.models import (
@@ -236,6 +236,85 @@ class TestRepoMetadata:
         assert metadata2.repo_id == metadata.repo_id
         assert metadata2.readme_content == metadata.readme_content
         assert metadata2.cached_at == metadata.cached_at
+
+
+class TestStarredRepoFormatting:
+    """Test StarredRepo formatting methods."""
+
+    def test_format_updated_hours_ago(self):
+        """Test format_updated with hours ago (line 166)."""
+        now = datetime.now(timezone.utc)
+        two_hours_ago = now - timedelta(hours=2)
+
+        repo = StarredRepo(
+            id="1",
+            full_name="test/repo",
+            name="repo",
+            owner="test",
+            updated_at=two_hours_ago
+        )
+
+        assert repo.format_updated() == "2h ago"
+
+    def test_format_updated_days_ago(self):
+        """Test format_updated with days ago (line 168)."""
+        now = datetime.now(timezone.utc)
+        three_days_ago = now - timedelta(days=3)
+
+        repo = StarredRepo(
+            id="1",
+            full_name="test/repo",
+            name="repo",
+            owner="test",
+            updated_at=three_days_ago
+        )
+
+        assert repo.format_updated() == "3d ago"
+
+    def test_format_updated_weeks_ago(self):
+        """Test format_updated with weeks ago (line 171)."""
+        now = datetime.now(timezone.utc)
+        two_weeks_ago = now - timedelta(days=14)
+
+        repo = StarredRepo(
+            id="1",
+            full_name="test/repo",
+            name="repo",
+            owner="test",
+            updated_at=two_weeks_ago
+        )
+
+        assert repo.format_updated() == "2w ago"
+
+    def test_format_updated_months_ago(self):
+        """Test format_updated with months ago (line 174)."""
+        now = datetime.now(timezone.utc)
+        two_months_ago = now - timedelta(days=60)
+
+        repo = StarredRepo(
+            id="1",
+            full_name="test/repo",
+            name="repo",
+            owner="test",
+            updated_at=two_months_ago
+        )
+
+        assert repo.format_updated() == "2mo ago"
+
+    def test_format_updated_years_ago(self):
+        """Test format_updated with years ago (line 177)."""
+        now = datetime.now(timezone.utc)
+        two_years_ago = now - timedelta(days=730)
+
+        repo = StarredRepo(
+            id="1",
+            full_name="test/repo",
+            name="repo",
+            owner="test",
+            updated_at=two_years_ago
+        )
+
+        assert repo.format_updated() == "2y ago"
 
 
 class TestFolderRepoLink:
