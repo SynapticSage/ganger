@@ -204,12 +204,19 @@ class DataLoader:
                 logger.info("Auto-categorization disabled in settings")
                 return
 
-            logger.info(f"Auto-categorizing {len(repos)} repos...")
+            total = len(repos)
+            logger.info(f"Auto-categorizing {total} repos...")
+
+            # Report start of categorization
+            await self._report_progress("Categorizing", 0, total)
 
             # Use folder manager's categorization
             categorized = await self.folder_manager.auto_categorize_all(repos)
 
-            total_categorized = sum(len(repos) for repos in categorized.values())
+            # Report completion
+            await self._report_progress("Categorizing", total, total)
+
+            total_categorized = sum(len(r) for r in categorized.values())
             logger.info(f"Auto-categorized {total_categorized} repos into {len(categorized)} folders")
 
         except Exception as e:
