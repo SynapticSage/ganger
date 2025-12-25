@@ -5,6 +5,7 @@ Modified: 2025-11-07
 """
 
 import json
+import logging
 import os
 import time
 import webbrowser
@@ -16,6 +17,9 @@ import httpx
 from github import Github, GithubException
 
 from ganger.core.exceptions import AuthenticationError
+
+
+logger = logging.getLogger(__name__)
 
 
 class GitHubAuth:
@@ -40,6 +44,7 @@ class GitHubAuth:
         self,
         token_file: Optional[Path] = None,
         auth_method: str = "auto",  # "auto", "oauth", "pat"
+        silent: bool = False,  # Suppress console output (for TUI mode)
     ):
         """
         Initialize GitHub authentication.
@@ -47,6 +52,7 @@ class GitHubAuth:
         Args:
             token_file: Path to store/load token (default: ~/.config/ganger/token.json)
             auth_method: Authentication method - "auto" tries env var first, then oauth
+            silent: If True, suppress console output (use logging instead)
         """
         if token_file is None:
             config_dir = Path.home() / ".config" / "ganger"
@@ -55,8 +61,15 @@ class GitHubAuth:
 
         self.token_file = token_file
         self.auth_method = auth_method
+        self.silent = silent
         self._token: Optional[str] = None
         self._github_client: Optional[Github] = None
+
+    def _log(self, message: str) -> None:
+        """Log message, also print if not in silent mode."""
+        logger.info(message)
+        if not self.silent:
+            print(message)
 
     def authenticate(self) -> None:
         """
@@ -66,7 +79,7 @@ class GitHubAuth:
         1. GITHUB_TOKEN environment variable (PAT)
         2. Existing token file
         3. OAuth device flow (if client ID configured)
-        4. Prompt user for PAT
+        4. Prompt user for PAT (only in non-silent mode)
 
         Raises:
             AuthenticationError: If authentication fails
@@ -76,7 +89,7 @@ class GitHubAuth:
         if env_token:
             self._token = env_token
             if self._verify_token():
-                print("✓ Authenticated via GITHUB_TOKEN environment variable")
+                self._log("✓ Authenticated via GITHUB_TOKEN environment variable")
                 return
             else:
                 raise AuthenticationError(
@@ -87,25 +100,29 @@ class GitHubAuth:
         if self.token_file.exists():
             if self._load_token():
                 if self._verify_token():
-                    print(f"✓ Authenticated via token file: {self.token_file}")
+                    self._log(f"✓ Authenticated via token file: {self.token_file}")
                     return
                 else:
-                    print("⚠ Stored token is invalid, re-authenticating...")
+                    logger.warning("Stored token is invalid, re-authenticating...")
+                    if not self.silent:
+                        print("⚠ Stored token is invalid, re-authenticating...")
                     self.token_file.unlink()  # Remove invalid token
 
         # Try OAuth device flow if client ID is configured
         if self.OAUTH_CLIENT_ID and self.auth_method in ["auto", "oauth"]:
-            print("Starting OAuth device flow authentication...")
+            self._log("Starting OAuth device flow authentication...")
             self._oauth_device_flow()
             return
 
-        # Fallback: prompt for PAT
-        if self.auth_method in ["auto", "pat"]:
+        # Fallback: prompt for PAT (only works in non-silent mode)
+        if self.auth_method in ["auto", "pat"] and not self.silent:
             self._prompt_for_pat()
             return
 
+        # In silent mode, if we get here, we have no valid auth
         raise AuthenticationError(
-            "No authentication method available. Set GITHUB_TOKEN or configure OAuth."
+            "No authentication method available. Set GITHUB_TOKEN environment variable "
+            "or run 'ganger auth' to authenticate."
         )
 
     def _verify_token(self) -> bool:
@@ -202,17 +219,20 @@ class GitHubAuth:
         expires_in = device_data["expires_in"]
         interval = device_data.get("interval", 5)
 
-        print("\n" + "=" * 60)
-        print("GitHub Authentication Required")
-        print("=" * 60)
-        print(f"\n1. Visit: {verification_uri}")
-        print(f"2. Enter code: {user_code}")
-        print(f"\nWaiting for authorization (expires in {expires_in}s)...\n")
+        if not self.silent:
+            print("\n" + "=" * 60)
+            print("GitHub Authentication Required")
+            print("=" * 60)
+            print(f"\n1. Visit: {verification_uri}")
+            print(f"2. Enter code: {user_code}")
+            print(f"\nWaiting for authorization (expires in {expires_in}s)...\n")
+        else:
+            logger.info(f"OAuth device flow: Visit {verification_uri} and enter code {user_code}")
 
         # Try to open browser automatically
         try:
             webbrowser.open(verification_uri)
-            print("✓ Opened browser automatically")
+            self._log("✓ Opened browser automatically")
         except Exception:
             pass
 
@@ -242,7 +262,8 @@ class GitHubAuth:
                     error = token_data["error"]
                     if error == "authorization_pending":
                         # Still waiting
-                        print(".", end="", flush=True)
+                        if not self.silent:
+                            print(".", end="", flush=True)
                         continue
                     elif error == "slow_down":
                         # Increase polling interval
@@ -261,9 +282,9 @@ class GitHubAuth:
                     self._save_token(self._token, token_data)
 
                     if self._verify_token():
-                        print("\n\n✓ Authentication successful!")
+                        self._log("\n✓ Authentication successful!")
                         user = self._github_client.get_user()
-                        print(f"✓ Logged in as: {user.login}")
+                        self._log(f"✓ Logged in as: {user.login}")
                         return
                     else:
                         raise AuthenticationError("Token verification failed")
@@ -277,9 +298,17 @@ class GitHubAuth:
         """
         Prompt user to enter a Personal Access Token.
 
+        Note: This only works in non-silent mode (CLI context).
+
         Raises:
             AuthenticationError: If PAT is invalid
         """
+        if self.silent:
+            raise AuthenticationError(
+                "Cannot prompt for PAT in silent mode. "
+                "Set GITHUB_TOKEN environment variable or run 'ganger auth'."
+            )
+
         print("\n" + "=" * 60)
         print("GitHub Personal Access Token Required")
         print("=" * 60)
@@ -297,9 +326,9 @@ class GitHubAuth:
         self._token = token
         if self._verify_token():
             self._save_token(token)
-            print("\n✓ Authentication successful!")
+            self._log("\n✓ Authentication successful!")
             user = self._github_client.get_user()
-            print(f"✓ Logged in as: {user.login}")
+            self._log(f"✓ Logged in as: {user.login}")
         else:
             raise AuthenticationError("Invalid token")
 
@@ -341,11 +370,11 @@ class GitHubAuth:
         """
         if self.token_file.exists():
             self.token_file.unlink()
-            print(f"✓ Deleted token file: {self.token_file}")
+            self._log(f"✓ Deleted token file: {self.token_file}")
 
         self._token = None
         self._github_client = None
-        print("✓ Credentials revoked")
+        self._log("✓ Credentials revoked")
 
     def get_user_info(self) -> Dict[str, Any]:
         """

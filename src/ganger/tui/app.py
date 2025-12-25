@@ -157,10 +157,7 @@ class GangerApp(App):
             # Load CSS
             await self._load_stylesheet()
 
-            # Setup authentication
-            await self.setup_authentication()
-
-            # Initialize cache
+            # Initialize cache FIRST (fast, required for offline mode)
             cache_path = self.config_dir / "cache.db"
             self.cache = PersistentCache(
                 db_path=cache_path,
@@ -171,7 +168,7 @@ class GangerApp(App):
             # Initialize folder manager
             self.folder_manager = FolderManager(self.cache)
 
-            # Create and mount MillerView
+            # Create and mount MillerView IMMEDIATELY (don't wait for auth)
             loading_msg = self.query_one("#loading-message")
             await loading_msg.remove()
 
@@ -182,13 +179,49 @@ class GangerApp(App):
             # Get status bar reference
             self.status_bar = self.query_one("#status-bar", StatusBar)
 
-            # Load initial data
+            # Load cached data immediately for fast startup
+            await self._load_cached_data()
+
+            # Start background initialization (auth + fresh data)
+            # Use create_task so UI remains responsive
+            asyncio.create_task(self._background_initialize())
+
+        except Exception as e:
+            logger.error(f"Error during initialization: {e}", exc_info=True)
+            self.notify(f"Initialization error: {e}", severity="error")
+            self.exit(1)
+
+    async def _load_cached_data(self) -> None:
+        """Load cached folders/repos for immediate display."""
+        try:
+            # Load folders from cache (fast)
+            await self.load_folders()
+
+            # If we have folders, select the first one
+            if self.miller_view and self.miller_view.folder_column and self.folders:
+                self.miller_view.folder_column.selected_index = 0
+                self.post_message(FolderSelected(self.folders[0]))
+
+            if self.status_bar:
+                self.status_bar.update_status("Loading...", "")
+
+        except Exception as e:
+            logger.warning(f"Could not load cached data: {e}")
+
+    async def _background_initialize(self) -> None:
+        """Run authentication and data loading in background.
+
+        This runs after the UI is already visible, keeping it responsive.
+        """
+        try:
+            # Setup authentication (may take time for OAuth or network)
+            await self.setup_authentication()
+
+            # Load fresh data if authenticated
             if self.api_client:
-                # Always load data if authenticated
                 await self.initialize_data()
             else:
-                # Offline mode - just load cached folders
-                await self.load_folders()
+                # No API client - stay in offline mode
                 if self.status_bar:
                     self.status_bar.update_status(
                         "Offline mode - Ctrl+R to sync",
@@ -197,9 +230,11 @@ class GangerApp(App):
                 self.notify("Offline mode. Press Ctrl+R when authenticated.", timeout=5)
 
         except Exception as e:
-            logger.error(f"Error during initialization: {e}", exc_info=True)
-            self.notify(f"Initialization error: {e}", severity="error")
-            self.exit(1)
+            logger.error(f"Background initialization failed: {e}", exc_info=True)
+            # Don't crash the app - just notify user
+            self.notify(f"Sync failed: {e}. Using cached data.", severity="warning", timeout=5)
+            if self.status_bar:
+                self.status_bar.update_status("Offline (sync failed)", "")
 
     async def _load_stylesheet(self) -> None:
         """Load application stylesheet."""
@@ -221,7 +256,8 @@ class GangerApp(App):
     async def setup_authentication(self) -> None:
         """Setup GitHub API authentication."""
         try:
-            self.auth = GitHubAuth()
+            # Use silent mode to suppress console output (we're in TUI)
+            self.auth = GitHubAuth(silent=True)
             # Run blocking authentication in thread pool to avoid blocking event loop
             await asyncio.to_thread(self.auth.authenticate)
             token = self.auth.get_token()
@@ -235,17 +271,18 @@ class GangerApp(App):
             )
 
             logger.info("GitHub authentication successful")
+            if self.status_bar:
+                self.status_bar.update_status("Authenticated", "")
 
         except Exception as e:
             logger.error(f"Authentication failed: {e}", exc_info=True)
             self.notify(
-                f"GitHub authentication failed: {e}.\n"
-                "Running in offline mode. Press Ctrl+C to exit.",
+                "GitHub auth failed. Run 'ganger auth' or set GITHUB_TOKEN.",
                 severity="warning",
-                timeout=10
+                timeout=5
             )
-            # Don't raise - continue in offline mode
-            # User can still view help, keybindings, etc.
+            # Don't raise - continue in offline mode with cached data
+            # User can still browse cached folders and repos
 
     async def initialize_data(self, force_refresh: bool = False) -> None:
         """Load initial data (starred repos, folders).
@@ -258,7 +295,9 @@ class GangerApp(App):
                 logger.error("API client or folder manager not initialized")
                 return
 
-            self.notify("Loading starred repositories...", timeout=2)
+            # Update status to show we're syncing
+            if self.status_bar:
+                self.status_bar.update_status("Syncing with GitHub...", "")
 
             # Create data loader
             from ..core.data_loader import DataLoader
@@ -271,7 +310,9 @@ class GangerApp(App):
 
             # Load starred repos (from cache or API)
             repos = await loader.load_starred_repos(force_refresh=force_refresh)
-            self.notify(f"Loaded {len(repos)} starred repos", timeout=2)
+
+            if self.status_bar:
+                self.status_bar.update_status(f"Loaded {len(repos)} repos", "")
 
             # Ensure default folders exist
             folders = await loader.ensure_default_folders()
@@ -282,7 +323,8 @@ class GangerApp(App):
 
             # Auto-categorize if enabled
             if self.settings.behavior.auto_categorize:
-                self.notify("Auto-categorizing repos...", timeout=1)
+                if self.status_bar:
+                    self.status_bar.update_status("Categorizing repos...", "")
                 await loader.auto_categorize_all(repos)
 
             # Load folders into UI
@@ -296,11 +338,15 @@ class GangerApp(App):
                 if self.folders:
                     self.post_message(FolderSelected(self.folders[0]))
 
-            self.notify("Ready!", timeout=1)
+            # Show ready status
+            if self.status_bar:
+                self.status_bar.update_status("Ready", "")
+            self.notify(f"Synced {len(repos)} starred repos", timeout=2)
 
         except Exception as e:
             logger.error(f"Error loading data: {e}", exc_info=True)
-            self.notify(f"Error loading data: {e}", severity="error", timeout=10)
+            self.notify(f"Error loading data: {e}", severity="warning", timeout=5)
+            # Don't crash - keep using cached data
 
     async def load_folders(self) -> None:
         """Load virtual folders and starred repos."""
