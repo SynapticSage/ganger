@@ -120,8 +120,11 @@ class TestRateLimiter:
         assert limiter.QUOTA_COSTS["list_starred"] == 1
         assert limiter.QUOTA_COSTS["search"] == 10
 
-    def test_wait_if_needed_when_exhausted(self, monkeypatch, capsys):
+    def test_wait_if_needed_when_exhausted(self, monkeypatch, caplog):
         """Test wait_if_needed blocks and resets when quota exhausted."""
+        import logging
+        caplog.set_level(logging.WARNING)
+
         limiter = RateLimiter(buffer=0)
 
         # Exhaust quota
@@ -144,10 +147,9 @@ class TestRateLimiter:
         assert limiter.quota_used == 0
         assert limiter.reset_time is None
 
-        # Verify warning message was printed
-        captured = capsys.readouterr()
-        assert "Rate limit exceeded" in captured.out
-        assert "Waiting" in captured.out
+        # Verify warning message was logged
+        assert "Rate limit exceeded" in caplog.text
+        assert "Waiting" in caplog.text
 
     def test_wait_if_needed_no_wait(self):
         """Test wait_if_needed doesn't block when quota available."""

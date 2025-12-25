@@ -10,7 +10,7 @@ import os
 import time
 import webbrowser
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 from datetime import datetime
 
 import httpx
@@ -45,6 +45,7 @@ class GitHubAuth:
         token_file: Optional[Path] = None,
         auth_method: str = "auto",  # "auto", "oauth", "pat"
         silent: bool = False,  # Suppress console output (for TUI mode)
+        oauth_callback: Optional[Callable[[str, str, int], None]] = None,
     ):
         """
         Initialize GitHub authentication.
@@ -53,6 +54,8 @@ class GitHubAuth:
             token_file: Path to store/load token (default: ~/.config/ganger/token.json)
             auth_method: Authentication method - "auto" tries env var first, then oauth
             silent: If True, suppress console output (use logging instead)
+            oauth_callback: Optional callback(user_code, verification_url, expires_in)
+                           called when OAuth device flow starts, for TUI integration
         """
         if token_file is None:
             config_dir = Path.home() / ".config" / "ganger"
@@ -62,6 +65,7 @@ class GitHubAuth:
         self.token_file = token_file
         self.auth_method = auth_method
         self.silent = silent
+        self.oauth_callback = oauth_callback
         self._token: Optional[str] = None
         self._github_client: Optional[Github] = None
 
@@ -218,6 +222,13 @@ class GitHubAuth:
         verification_uri = device_data["verification_uri"]
         expires_in = device_data["expires_in"]
         interval = device_data.get("interval", 5)
+
+        # Call the OAuth callback if provided (for TUI integration)
+        if self.oauth_callback:
+            try:
+                self.oauth_callback(user_code, verification_uri, expires_in)
+            except Exception as e:
+                logger.warning(f"OAuth callback failed: {e}")
 
         if not self.silent:
             print("\n" + "=" * 60)

@@ -7,8 +7,7 @@ Modified: 2025-11-08
 
 import asyncio
 import logging
-from typing import List, Optional
-from pathlib import Path
+from typing import List, Optional, Callable, Awaitable
 
 from .github_client import GitHubAPIClient
 from .exceptions import CacheError
@@ -18,6 +17,9 @@ from .models import StarredRepo, VirtualFolder
 from ..config.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+# Type alias for progress callback: (label, current, total) -> None
+ProgressCallback = Callable[[str, int, int], Awaitable[None]]
 
 
 class DataLoader:
@@ -29,6 +31,7 @@ class DataLoader:
         cache: PersistentCache,
         folder_manager: FolderManager,
         settings: Settings,
+        progress_callback: Optional[ProgressCallback] = None,
     ):
         """Initialize data loader.
 
@@ -37,11 +40,21 @@ class DataLoader:
             cache: Persistent cache
             folder_manager: Folder manager
             settings: Application settings
+            progress_callback: Optional async callback(label, current, total) for progress
         """
         self.api_client = api_client
         self.cache = cache
         self.folder_manager = folder_manager
         self.settings = settings
+        self.progress_callback = progress_callback
+
+    async def _report_progress(self, label: str, current: int, total: int) -> None:
+        """Report progress if callback is set."""
+        if self.progress_callback:
+            try:
+                await self.progress_callback(label, current, total)
+            except Exception as e:
+                logger.warning(f"Progress callback failed: {e}")
 
     async def load_starred_repos(self, force_refresh: bool = False) -> List[StarredRepo]:
         """Load starred repos from cache or GitHub API.
@@ -147,6 +160,7 @@ class DataLoader:
         """
         try:
             all_stars_id = "all-stars"
+            total = len(all_repos)
 
             # Get current repos in All Stars
             current_repo_ids = set()
@@ -157,9 +171,9 @@ class DataLoader:
                 # Folder might not exist yet
                 pass
 
-            # Add any missing repos
+            # Add any missing repos with progress reporting
             added = 0
-            for repo in all_repos:
+            for i, repo in enumerate(all_repos):
                 if repo.id not in current_repo_ids:
                     await self.cache.add_repo_to_folder(
                         repo_id=repo.id,
@@ -167,6 +181,10 @@ class DataLoader:
                         is_manual=False,  # Auto-managed
                     )
                     added += 1
+
+                # Report progress every 10 repos or at the end
+                if (i + 1) % 10 == 0 or i == total - 1:
+                    await self._report_progress("Syncing", i + 1, total)
 
             if added > 0:
                 logger.info(f"Added {added} repos to 'All Stars' folder")

@@ -4,9 +4,13 @@ Rate limiter for GitHub API.
 Modified: 2025-11-07
 """
 
+import asyncio
+import logging
 import time
 from datetime import datetime
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
@@ -125,15 +129,32 @@ class RateLimiter:
 
     def wait_if_needed(self) -> None:
         """
-        Wait if rate limit is exhausted.
+        Wait if rate limit is exhausted (blocking version).
 
         This will block until the rate limit resets.
+        For async contexts, use wait_if_needed_async() instead.
         """
         if self.should_wait():
             wait_time = self.get_wait_time()
             if wait_time > 0:
-                print(f"⚠ Rate limit exceeded. Waiting {wait_time}s until reset...")
+                logger.warning(f"Rate limit exceeded. Waiting {wait_time}s until reset...")
                 time.sleep(wait_time)
+                # Reset counters after waiting
+                self.quota_used = 0
+                self.reset_time = None
+
+    async def wait_if_needed_async(self) -> None:
+        """
+        Wait if rate limit is exhausted (async version).
+
+        This uses asyncio.sleep() instead of time.sleep() to avoid
+        blocking the event loop. Use this in async contexts like TUI or MCP.
+        """
+        if self.should_wait():
+            wait_time = self.get_wait_time()
+            if wait_time > 0:
+                logger.warning(f"Rate limit exceeded. Waiting {wait_time}s until reset...")
+                await asyncio.sleep(wait_time)
                 # Reset counters after waiting
                 self.quota_used = 0
                 self.reset_time = None

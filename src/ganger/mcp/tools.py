@@ -6,6 +6,7 @@ Defines all MCP tools that expose Ganger functionality to LLMs.
 Modified: 2025-11-07
 """
 
+import asyncio
 from typing import Any, Dict, List
 from mcp.server import Server
 from mcp.types import Tool, TextContent
@@ -305,11 +306,16 @@ async def _handle_tool_call(
         if use_cache:
             repos = await cache.get_starred_repos()
             if repos is None:
-                # Cache miss, fetch from GitHub
-                repos = github.get_starred_repos(max_count=max_count)
+                # Cache miss, fetch from GitHub (run in thread to avoid blocking)
+                repos = await asyncio.to_thread(
+                    github.get_starred_repos, max_count=max_count
+                )
                 await cache.set_starred_repos(repos)
         else:
-            repos = github.get_starred_repos(max_count=max_count)
+            # Force refresh from GitHub (run in thread to avoid blocking)
+            repos = await asyncio.to_thread(
+                github.get_starred_repos, max_count=max_count
+            )
             await cache.set_starred_repos(repos)
 
         return {
@@ -330,8 +336,9 @@ async def _handle_tool_call(
 
     elif name == "get_repo_details":
         full_name = arguments["full_name"]
-        repo = github.get_repo(full_name)
-        metadata = github.get_readme(full_name)
+        # Run blocking API calls in thread pool
+        repo = await asyncio.to_thread(github.get_repo, full_name)
+        metadata = await asyncio.to_thread(github.get_readme, full_name)
 
         # Cache metadata
         if metadata:
@@ -346,18 +353,19 @@ async def _handle_tool_call(
 
     elif name == "star_repository":
         full_name = arguments["full_name"]
-        github.star_repo(full_name)
+        await asyncio.to_thread(github.star_repo, full_name)
         return {"success": True, "message": f"Starred {full_name}"}
 
     elif name == "unstar_repository":
         full_name = arguments["full_name"]
-        github.unstar_repo(full_name)
+        await asyncio.to_thread(github.unstar_repo, full_name)
         return {"success": True, "message": f"Unstarred {full_name}"}
 
     elif name == "search_repositories":
         query = arguments["query"]
         max_results = arguments.get("max_results", 30)
-        repos = github.search_repos(query, max_results)
+        # Run blocking search in thread pool
+        repos = await asyncio.to_thread(github.search_repos, query, max_results)
 
         return {
             "count": len(repos),

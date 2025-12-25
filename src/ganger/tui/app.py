@@ -284,11 +284,12 @@ class GangerApp(App):
             # Don't raise - continue in offline mode with cached data
             # User can still browse cached folders and repos
 
-    async def initialize_data(self, force_refresh: bool = False) -> None:
+    async def initialize_data(self, force_refresh: bool = False, lazy: bool = True) -> None:
         """Load initial data (starred repos, folders).
 
         Args:
             force_refresh: Force fetch from GitHub API
+            lazy: If True, defer heavy operations (sync, categorization) to background
         """
         try:
             if not self.api_client or not self.folder_manager:
@@ -318,35 +319,60 @@ class GangerApp(App):
             folders = await loader.ensure_default_folders()
             logger.info(f"Ensured {len(folders)} default folders exist")
 
-            # Sync "All Stars" folder
-            await loader.sync_all_stars_folder(repos)
-
-            # Auto-categorize if enabled
-            if self.settings.behavior.auto_categorize:
-                if self.status_bar:
-                    self.status_bar.update_status("Categorizing repos...", "")
-                await loader.auto_categorize_all(repos)
-
-            # Load folders into UI
+            # Load folders into UI first (fast - improves perceived performance)
             await self.load_folders()
 
-            # Auto-select "All Stars" folder
+            # Auto-select first folder to show repos immediately
             if self.miller_view and self.miller_view.folder_column:
-                # Select first folder (should be "All Stars")
                 self.miller_view.folder_column.selected_index = 0
-                # Trigger folder selection to load repos
                 if self.folders:
                     self.post_message(FolderSelected(self.folders[0]))
 
-            # Show ready status
+            # Show ready status early
             if self.status_bar:
                 self.status_bar.update_status("Ready", "")
             self.notify(f"Synced {len(repos)} starred repos", timeout=2)
+
+            # Defer heavy operations to background for lazy loading
+            if lazy:
+                asyncio.create_task(self._deferred_sync(loader, repos))
+            else:
+                # Run sync operations immediately
+                await loader.sync_all_stars_folder(repos)
+                if self.settings.behavior.auto_categorize:
+                    await loader.auto_categorize_all(repos)
+                # Refresh folders after sync
+                await self.load_folders()
 
         except Exception as e:
             logger.error(f"Error loading data: {e}", exc_info=True)
             self.notify(f"Error loading data: {e}", severity="warning", timeout=5)
             # Don't crash - keep using cached data
+
+    async def _deferred_sync(self, loader, repos) -> None:
+        """Run deferred sync operations in background.
+
+        This improves perceived startup time by deferring heavy
+        operations until after the UI is responsive.
+        """
+        try:
+            # Small delay to let UI settle
+            await asyncio.sleep(0.5)
+
+            # Sync "All Stars" folder in background
+            await loader.sync_all_stars_folder(repos)
+
+            # Auto-categorize if enabled
+            if self.settings.behavior.auto_categorize:
+                await loader.auto_categorize_all(repos)
+
+            # Refresh folders to show updated counts
+            await self.load_folders()
+
+            logger.info("Deferred sync completed")
+
+        except Exception as e:
+            logger.warning(f"Deferred sync failed: {e}")
 
     async def load_folders(self) -> None:
         """Load virtual folders and starred repos."""

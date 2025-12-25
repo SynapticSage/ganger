@@ -172,3 +172,30 @@ class StatusBar(Widget):
                     self.center_widget.update(original)
 
             self.set_timer(duration, reset)
+
+    def show_progress(self, label: str, current: int, total: int) -> None:
+        """Show a progress indicator in the center.
+
+        Args:
+            label: Progress label (e.g., "Syncing")
+            current: Current progress value
+            total: Total value for 100%
+        """
+        if not self.center_widget or total <= 0:
+            return
+
+        percentage = min(100, int((current / total) * 100))
+
+        # Create a simple progress bar
+        bar_width = 20
+        filled = int(bar_width * percentage / 100)
+        empty = bar_width - filled
+
+        bar = "█" * filled + "░" * empty
+        progress_text = f"{label}: [{bar}] {percentage}%"
+
+        self.center_widget.update(progress_text)
+
+    def clear_progress(self) -> None:
+        """Clear progress and show default hints."""
+        self.update_hints()
