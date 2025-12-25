@@ -300,13 +300,14 @@ class GangerApp(App):
             if self.status_bar:
                 self.status_bar.update_status("Syncing with GitHub...", "")
 
-            # Create data loader
+            # Create data loader with progress callback
             from ..core.data_loader import DataLoader
             loader = DataLoader(
                 self.api_client,
                 self.cache,
                 self.folder_manager,
-                self.settings
+                self.settings,
+                progress_callback=self._on_progress,
             )
 
             # Load starred repos (from cache or API)
@@ -343,11 +344,24 @@ class GangerApp(App):
                     await loader.auto_categorize_all(repos)
                 # Refresh folders after sync
                 await self.load_folders()
+                if self.status_bar:
+                    self.status_bar.clear_progress()
 
         except Exception as e:
             logger.error(f"Error loading data: {e}", exc_info=True)
             self.notify(f"Error loading data: {e}", severity="warning", timeout=5)
             # Don't crash - keep using cached data
+
+    async def _on_progress(self, label: str, current: int, total: int) -> None:
+        """Handle progress updates from data loader.
+
+        Args:
+            label: Progress label (e.g., "Syncing")
+            current: Current progress value
+            total: Total value for 100%
+        """
+        if self.status_bar:
+            self.status_bar.show_progress(label, current, total)
 
     async def _deferred_sync(self, loader, repos) -> None:
         """Run deferred sync operations in background.
@@ -359,7 +373,7 @@ class GangerApp(App):
             # Small delay to let UI settle
             await asyncio.sleep(0.5)
 
-            # Sync "All Stars" folder in background
+            # Sync "All Stars" folder in background (with progress)
             await loader.sync_all_stars_folder(repos)
 
             # Auto-categorize if enabled
@@ -369,10 +383,17 @@ class GangerApp(App):
             # Refresh folders to show updated counts
             await self.load_folders()
 
+            # Clear progress and restore hints
+            if self.status_bar:
+                self.status_bar.clear_progress()
+
             logger.info("Deferred sync completed")
 
         except Exception as e:
             logger.warning(f"Deferred sync failed: {e}")
+            # Clear progress on error too
+            if self.status_bar:
+                self.status_bar.clear_progress()
 
     async def load_folders(self) -> None:
         """Load virtual folders and starred repos."""
@@ -575,23 +596,31 @@ class GangerApp(App):
 
             self.current_folder = message.folder
 
-            # Get repos in this folder
+            # Show loading indicator for folder with many repos
+            if self.status_bar:
+                self.status_bar.update_status(f"Loading {message.folder.name}...", "")
+
+            # Get repos in this folder (lazy load on-demand)
             self.current_repos = await self.folder_manager.get_folder_repos(message.folder.id)
 
             # Update MillerView
             if self.miller_view:
                 await self.miller_view.set_repos(self.current_repos)
 
-            # Update status bar
+            # Update status bar with folder context
             if self.status_bar:
                 self.status_bar.update_context(
-                    message.folder.name,
+                    f"{message.folder.name} ({len(self.current_repos)})",
                     selected_count=self.miller_view.get_marked_count() if self.miller_view else 0
                 )
+                # Clear loading status
+                self.status_bar.update_hints()
 
         except Exception as e:
             logger.error(f"Error loading repos for folder: {e}", exc_info=True)
             self.notify(f"Error loading repos: {e}", severity="error")
+            if self.status_bar:
+                self.status_bar.update_hints()
 
     async def on_repo_selected(self, message: RepoSelected) -> None:
         """Handle repo selection - update preview."""
