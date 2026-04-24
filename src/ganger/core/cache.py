@@ -7,14 +7,18 @@ Shared state between TUI and MCP interfaces.
 Modified: 2025-11-07
 """
 
-import json
 import aiosqlite
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Iterable, AsyncIterator
 from datetime import datetime, timedelta
 
-from ganger.core.models import StarredRepo, VirtualFolder, RepoMetadata, FolderRepoLink
+from ganger.core.models import StarredRepo, VirtualFolder, RepoMetadata
 from ganger.core.exceptions import CacheError
+
+
+logger = logging.getLogger(__name__)
 
 
 class PersistentCache:
@@ -29,7 +33,7 @@ class PersistentCache:
     """
 
     # Schema version for migrations
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, db_path: Optional[Path] = None, ttl_seconds: int = 3600):
         """
@@ -48,13 +52,100 @@ class PersistentCache:
         self.ttl_seconds = ttl_seconds
         self._connection: Optional[aiosqlite.Connection] = None
 
+    @asynccontextmanager
+    async def _connect(
+        self,
+        *,
+        row_factory: Optional[type] = None,
+    ) -> AsyncIterator[aiosqlite.Connection]:
+        """Open a database connection with foreign keys enabled."""
+        db = await aiosqlite.connect(self.db_path)
+        try:
+            await db.execute("PRAGMA foreign_keys = ON")
+            if row_factory is not None:
+                db.row_factory = row_factory
+            yield db
+        finally:
+            await db.close()
+
+    @staticmethod
+    async def _get_schema_version(db: aiosqlite.Connection) -> int:
+        """Read the stored schema version."""
+        cursor = await db.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    async def _migrate_v1_to_v2(db: aiosqlite.Connection) -> None:
+        """Drop the repo metadata foreign key so metadata can be cached independently."""
+        await db.execute("PRAGMA foreign_keys = OFF")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS repo_metadata_v2 (
+                repo_id TEXT PRIMARY KEY,
+                readme_content TEXT,
+                readme_format TEXT DEFAULT 'markdown',
+                has_issues BOOLEAN DEFAULT 1,
+                open_issues_count INTEGER DEFAULT 0,
+                has_wiki BOOLEAN DEFAULT 0,
+                has_projects BOOLEAN DEFAULT 0,
+                has_pages BOOLEAN DEFAULT 0,
+                cached_at TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            INSERT OR REPLACE INTO repo_metadata_v2 (
+                repo_id, readme_content, readme_format, has_issues, open_issues_count,
+                has_wiki, has_projects, has_pages, cached_at
+            )
+            SELECT
+                repo_id, readme_content, readme_format, has_issues, open_issues_count,
+                has_wiki, has_projects, has_pages, cached_at
+            FROM repo_metadata
+        """)
+        await db.execute("DROP TABLE repo_metadata")
+        await db.execute("ALTER TABLE repo_metadata_v2 RENAME TO repo_metadata")
+        await db.execute("PRAGMA foreign_keys = ON")
+        logger.info("Migrated cache schema from v1 to v2")
+
+    @staticmethod
+    async def _cleanup_orphaned_folder_links(db: aiosqlite.Connection) -> None:
+        """Remove stale folder links left behind by older cache semantics."""
+        await db.execute("""
+            DELETE FROM folder_repos
+            WHERE repo_id NOT IN (SELECT id FROM starred_repos)
+               OR folder_id NOT IN (SELECT id FROM virtual_folders)
+        """)
+
+    @staticmethod
+    async def _delete_repo_metadata(
+        db: aiosqlite.Connection,
+        repo_ids: Iterable[str],
+    ) -> None:
+        """Delete cached metadata for the specified repo ids."""
+        repo_ids = tuple(repo_ids)
+        if not repo_ids:
+            return
+
+        placeholders = ", ".join("?" for _ in repo_ids)
+        await db.execute(
+            f"DELETE FROM repo_metadata WHERE repo_id IN ({placeholders})",
+            repo_ids,
+        )
+
     async def initialize(self) -> None:
         """
         Initialize database schema.
 
         Creates all tables if they don't exist.
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("PRAGMA foreign_keys = ON")
 
             # Table: starred_repos
@@ -123,8 +214,7 @@ class PersistentCache:
                     has_wiki BOOLEAN DEFAULT 0,
                     has_projects BOOLEAN DEFAULT 0,
                     has_pages BOOLEAN DEFAULT 0,
-                    cached_at TEXT NOT NULL,
-                    FOREIGN KEY (repo_id) REFERENCES starred_repos(id) ON DELETE CASCADE
+                    cached_at TEXT NOT NULL
                 )
             """)
 
@@ -141,6 +231,12 @@ class PersistentCache:
                     value TEXT
                 )
             """)
+            current_version = await self._get_schema_version(db)
+            if current_version == 1:
+                await self._migrate_v1_to_v2(db)
+
+            await self._cleanup_orphaned_folder_links(db)
+
             await db.execute(
                 "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?)",
                 (str(self.SCHEMA_VERSION),),
@@ -160,9 +256,7 @@ class PersistentCache:
         Returns:
             List of StarredRepo objects, or None if cache expired/empty
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-
+        async with self._connect(row_factory=aiosqlite.Row) as db:
             # Check if cache is expired
             if not force_refresh:
                 cursor = await db.execute(
@@ -188,25 +282,35 @@ class PersistentCache:
 
             return repos
 
-    async def set_starred_repos(self, repos: List[StarredRepo]) -> None:
+    async def set_starred_repos(
+        self,
+        repos: List[StarredRepo],
+        prune_missing: bool = True,
+    ) -> None:
         """
         Cache starred repos.
 
         Args:
             repos: List of StarredRepo objects to cache
+            prune_missing: Remove repos that are not present in this snapshot
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            # Clear existing repos
-            await db.execute("DELETE FROM starred_repos")
+        async with self._connect() as db:
+            now = datetime.now().isoformat()
+            repo_ids = {repo.id for repo in repos}
 
-            # Insert new repos
+            cursor = await db.execute("SELECT id FROM starred_repos")
+            existing_repo_ids = {row[0] for row in await cursor.fetchall()}
+
+            rows = []
             for repo in repos:
                 data = repo.to_dict()
-                data["cached_at"] = datetime.now().isoformat()
-                data["accessed_at"] = datetime.now().isoformat()
+                data["cached_at"] = now
+                data["accessed_at"] = now
+                rows.append(data)
 
-                await db.execute("""
-                    INSERT OR REPLACE INTO starred_repos (
+            if rows:
+                await db.executemany("""
+                    INSERT INTO starred_repos (
                         id, full_name, name, owner, description, stars_count, forks_count,
                         watchers_count, language, topics, is_archived, is_private, is_fork,
                         created_at, updated_at, pushed_at, starred_at, url, clone_url,
@@ -217,7 +321,44 @@ class PersistentCache:
                         :created_at, :updated_at, :pushed_at, :starred_at, :url, :clone_url,
                         :homepage, :default_branch, :license, :cached_at, :accessed_at
                     )
-                """, data)
+                    ON CONFLICT(id) DO UPDATE SET
+                        full_name = excluded.full_name,
+                        name = excluded.name,
+                        owner = excluded.owner,
+                        description = excluded.description,
+                        stars_count = excluded.stars_count,
+                        forks_count = excluded.forks_count,
+                        watchers_count = excluded.watchers_count,
+                        language = excluded.language,
+                        topics = excluded.topics,
+                        is_archived = excluded.is_archived,
+                        is_private = excluded.is_private,
+                        is_fork = excluded.is_fork,
+                        created_at = excluded.created_at,
+                        updated_at = excluded.updated_at,
+                        pushed_at = excluded.pushed_at,
+                        starred_at = excluded.starred_at,
+                        url = excluded.url,
+                        clone_url = excluded.clone_url,
+                        homepage = excluded.homepage,
+                        default_branch = excluded.default_branch,
+                        license = excluded.license,
+                        cached_at = excluded.cached_at,
+                        accessed_at = excluded.accessed_at
+                """, rows)
+
+            stale_repo_ids = existing_repo_ids - repo_ids if prune_missing else set()
+            if stale_repo_ids:
+                await self._delete_repo_metadata(db, stale_repo_ids)
+                placeholders = ", ".join("?" for _ in stale_repo_ids)
+                await db.execute(
+                    f"DELETE FROM starred_repos WHERE id IN ({placeholders})",
+                    tuple(stale_repo_ids),
+                )
+
+            if not repos and prune_missing:
+                await db.execute("DELETE FROM starred_repos")
+                await db.execute("DELETE FROM repo_metadata")
 
             await db.commit()
 
@@ -231,8 +372,7 @@ class PersistentCache:
         Returns:
             StarredRepo object, or None if not found
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self._connect(row_factory=aiosqlite.Row) as db:
 
             cursor = await db.execute("SELECT * FROM starred_repos WHERE id = ?", (repo_id,))
             row = await cursor.fetchone()
@@ -251,7 +391,8 @@ class PersistentCache:
 
     async def invalidate_repos(self) -> None:
         """Invalidate (clear) all starred repos from cache."""
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
+            await db.execute("DELETE FROM repo_metadata")
             await db.execute("DELETE FROM starred_repos")
             await db.commit()
 
@@ -264,8 +405,7 @@ class PersistentCache:
         Returns:
             List of VirtualFolder objects
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self._connect(row_factory=aiosqlite.Row) as db:
 
             cursor = await db.execute(
                 "SELECT * FROM virtual_folders ORDER BY created_at ASC"
@@ -303,7 +443,7 @@ class PersistentCache:
         Raises:
             CacheError: If folder with same name exists
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             data = folder.to_dict()
 
             # Set created_at/updated_at if not provided
@@ -331,7 +471,7 @@ class PersistentCache:
         Args:
             folder_id: Folder ID to delete
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("DELETE FROM virtual_folders WHERE id = ?", (folder_id,))
             # folder_repos entries are deleted automatically via CASCADE
             await db.commit()
@@ -346,8 +486,7 @@ class PersistentCache:
         Returns:
             List of StarredRepo objects in this folder
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self._connect(row_factory=aiosqlite.Row) as db:
 
             cursor = await db.execute("""
                 SELECT r.* FROM starred_repos r
@@ -370,7 +509,7 @@ class PersistentCache:
             folder_id: Folder ID
             is_manual: True if manually added, False if auto-matched
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute("""
                 INSERT OR REPLACE INTO folder_repos (folder_id, repo_id, is_manual, added_at)
                 VALUES (?, ?, ?, ?)
@@ -385,7 +524,7 @@ class PersistentCache:
             repo_id: Repository ID
             folder_id: Folder ID
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             await db.execute(
                 "DELETE FROM folder_repos WHERE folder_id = ? AND repo_id = ?",
                 (folder_id, repo_id),
@@ -404,8 +543,7 @@ class PersistentCache:
         Returns:
             RepoMetadata object, or None if not cached
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self._connect(row_factory=aiosqlite.Row) as db:
 
             cursor = await db.execute(
                 "SELECT * FROM repo_metadata WHERE repo_id = ?", (repo_id,)
@@ -424,7 +562,7 @@ class PersistentCache:
         Args:
             metadata: RepoMetadata object to cache
         """
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             data = metadata.to_dict()
 
             await db.execute("""
@@ -449,15 +587,16 @@ class PersistentCache:
         """
         cutoff_time = datetime.now() - timedelta(seconds=self.ttl_seconds)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             cursor = await db.execute(
-                "SELECT COUNT(*) as count FROM starred_repos WHERE cached_at < ?",
+                "SELECT id FROM starred_repos WHERE cached_at < ?",
                 (cutoff_time.isoformat(),),
             )
-            row = await cursor.fetchone()
-            count = row[0] if row else 0
+            repo_ids = [row[0] for row in await cursor.fetchall()]
+            count = len(repo_ids)
 
             if count > 0:
+                await self._delete_repo_metadata(db, repo_ids)
                 await db.execute(
                     "DELETE FROM starred_repos WHERE cached_at < ?",
                     (cutoff_time.isoformat(),),
@@ -473,8 +612,7 @@ class PersistentCache:
         Returns:
             Dictionary with cache stats
         """
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
+        async with self._connect(row_factory=aiosqlite.Row) as db:
 
             # Count repos
             cursor = await db.execute("SELECT COUNT(*) as count FROM starred_repos")

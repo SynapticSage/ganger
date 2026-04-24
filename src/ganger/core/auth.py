@@ -46,6 +46,7 @@ class GitHubAuth:
         auth_method: str = "auto",  # "auto", "oauth", "pat"
         silent: bool = False,  # Suppress console output (for TUI mode)
         oauth_callback: Optional[Callable[[str, str, int], None]] = None,
+        token: Optional[str] = None,
     ):
         """
         Initialize GitHub authentication.
@@ -66,7 +67,7 @@ class GitHubAuth:
         self.auth_method = auth_method
         self.silent = silent
         self.oauth_callback = oauth_callback
-        self._token: Optional[str] = None
+        self._token: Optional[str] = token
         self._github_client: Optional[Github] = None
 
     def _log(self, message: str) -> None:
@@ -88,6 +89,13 @@ class GitHubAuth:
         Raises:
             AuthenticationError: If authentication fails
         """
+        # Try explicitly configured token first
+        if self._token:
+            if self._verify_token():
+                self._log("✓ Authenticated via configured token")
+                return
+            raise AuthenticationError("Configured GitHub token is invalid")
+
         # Try environment variable first (PAT)
         env_token = os.getenv("GITHUB_TOKEN")
         if env_token:

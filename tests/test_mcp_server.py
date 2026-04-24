@@ -13,6 +13,8 @@ from unittest.mock import Mock, patch, AsyncMock
 from ganger.mcp.server import create_server, GangerMCPServer, main
 from ganger.core.auth import GitHubAuth
 from ganger.core.exceptions import GangerError, AuthenticationError
+from ganger.mcp.tools import _handle_tool_call
+from ganger.config.settings import Settings
 
 
 @patch("ganger.mcp.server.GitHubAuth")
@@ -97,25 +99,30 @@ class TestAuthenticationError:
 class TestMainEntryPoint:
     """Test main() entry point."""
 
+    @patch("ganger.mcp.server.Settings.load")
     @patch("ganger.mcp.server.create_server")
     @patch.dict(os.environ, {}, clear=True)
-    def test_main_with_defaults(self, mock_create_server):
+    def test_main_with_defaults(self, mock_create_server, mock_settings_load):
         """Test main() with default env vars (lines 105-112)."""
         mock_server = Mock()
         mock_create_server.return_value = mock_server
+        mock_settings_load.return_value = Settings()
 
         main()
 
         # Verify create_server was called with defaults
-        mock_create_server.assert_called_once_with(cache_path=None, cache_ttl=3600)
+        expected_cache_path = Path("~/.cache/ganger/ganger.db").expanduser()
+        mock_create_server.assert_called_once_with(cache_path=expected_cache_path, cache_ttl=3600)
         mock_server.run.assert_called_once()
 
+    @patch("ganger.mcp.server.Settings.load")
     @patch("ganger.mcp.server.create_server")
     @patch.dict(os.environ, {"GANGER_CACHE_PATH": "/tmp/test.db", "GANGER_CACHE_TTL": "7200"})
-    def test_main_with_env_vars(self, mock_create_server):
+    def test_main_with_env_vars(self, mock_create_server, mock_settings_load):
         """Test main() reads environment variables (lines 105-112)."""
         mock_server = Mock()
         mock_create_server.return_value = mock_server
+        mock_settings_load.return_value = Settings()
 
         main()
 
@@ -124,12 +131,14 @@ class TestMainEntryPoint:
         mock_create_server.assert_called_once_with(cache_path=expected_cache_path, cache_ttl=7200)
         mock_server.run.assert_called_once()
 
+    @patch("ganger.mcp.server.Settings.load")
     @patch("ganger.mcp.server.create_server")
     @patch.dict(os.environ, {"GANGER_CACHE_TTL": "invalid"})
-    def test_main_with_invalid_ttl(self, mock_create_server):
+    def test_main_with_invalid_ttl(self, mock_create_server, mock_settings_load):
         """Test main() with invalid TTL env var."""
         mock_server = Mock()
         mock_create_server.return_value = mock_server
+        mock_settings_load.return_value = Settings()
 
         # Should raise ValueError when trying to convert "invalid" to int
         with pytest.raises(ValueError):
@@ -183,3 +192,52 @@ class TestRunFlow:
 
         # Verify server.run was called with streams
         server.server.run.assert_called_once_with(mock_read_stream, mock_write_stream, {})
+
+
+class TestToolCaching:
+    """Test MCP tool behavior around cache usage."""
+
+    @pytest.mark.asyncio
+    async def test_list_starred_repos_does_not_cache_truncated_results(self):
+        """Partial list requests must not replace the full cached snapshot."""
+        repos = [Mock(id="1", full_name="user/repo1", description="", stars_count=1, language=None, topics=[], url="")]
+
+        server = Mock()
+        server.github_client = Mock()
+        server.github_client.get_starred_repos.return_value = repos
+        server.folder_manager = Mock()
+        server.cache = AsyncMock()
+        server.cache.get_starred_repos.return_value = None
+
+        result = await _handle_tool_call(
+            "list_starred_repos",
+            {"use_cache": False, "max_count": 1},
+            server,
+        )
+
+        server.cache.set_starred_repos.assert_not_awaited()
+        assert result["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_list_starred_repos_slices_cached_results_for_max_count(self):
+        """Cached snapshots can satisfy max_count requests without a network call."""
+        repos = [
+            Mock(id="1", full_name="user/repo1", description="", stars_count=1, language=None, topics=[], url=""),
+            Mock(id="2", full_name="user/repo2", description="", stars_count=2, language=None, topics=[], url=""),
+        ]
+
+        server = Mock()
+        server.github_client = Mock()
+        server.folder_manager = Mock()
+        server.cache = AsyncMock()
+        server.cache.get_starred_repos.return_value = repos
+
+        result = await _handle_tool_call(
+            "list_starred_repos",
+            {"use_cache": True, "max_count": 1},
+            server,
+        )
+
+        server.github_client.get_starred_repos.assert_not_called()
+        assert result["count"] == 1
+        assert result["repos"][0]["id"] == "1"

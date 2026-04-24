@@ -231,7 +231,7 @@ class TestRateLimiting:
         client = GitHubAPIClient(mock_auth, rate_limit_buffer=100)
         repos = client._get_starred_rest(max_count=10)
 
-        assert client.rate_limiter.quota_used == 10
+        assert client.rate_limiter.quota_used == 1
 
     @patch("ganger.core.github_client.GhApi")
     def test_rate_limiter_warns_on_low_quota(self, mock_ghapi, mock_auth):

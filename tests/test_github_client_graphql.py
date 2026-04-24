@@ -14,7 +14,7 @@ import pytest
 from ganger.core.github_client import GitHubAPIClient
 from ganger.core.auth import GitHubAuth
 from ganger.core.models import StarredRepo
-from ganger.core.exceptions import RateLimitExceededError
+from ganger.core.exceptions import GangerError, RateLimitExceededError
 from tests.utils import MockGraphQLResponse
 
 
@@ -231,8 +231,8 @@ class TestGraphQLErrorHandling:
         assert repos[0].full_name == "user/repo"
 
     @patch("ganger.core.github_client.GhApi")
-    def test_graphql_handles_rate_limit_error(self, mock_ghapi, mock_auth):
-        """Test handling of GraphQL rate limit errors."""
+    def test_graphql_raises_on_rate_limit_error(self, mock_ghapi, mock_auth):
+        """Explicit GraphQL rate limit responses should surface as rate-limit errors."""
         # Setup: GraphQL returns rate limit error
         error_response = MockGraphQLResponse.create_error_response(
             "API rate limit exceeded",
@@ -245,11 +245,65 @@ class TestGraphQLErrorHandling:
 
         client = GitHubAPIClient(mock_auth)
 
-        # For now, this will fall back to REST (no explicit rate limit handling)
-        # In future, could check for specific error and raise RateLimitExceededError
-        # This test documents current behavior
+        with pytest.raises(RateLimitExceededError, match="API rate limit exceeded"):
+            client._get_starred_graphql()
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_graphql_raises_on_generic_error_response(self, mock_ghapi, mock_auth):
+        """Generic GraphQL API errors should not silently fall back to REST."""
+        error_response = MockGraphQLResponse.create_error_response(
+            "Something went wrong",
+            "INTERNAL",
+        )
+
+        mock_ghapi_instance = Mock()
+        mock_ghapi_instance.graphql.query.return_value = error_response
+        mock_ghapi.return_value = mock_ghapi_instance
+
+        client = GitHubAPIClient(mock_auth)
+
+        with pytest.raises(GangerError, match="Something went wrong"):
+            client._get_starred_graphql()
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_graphql_handles_transport_fallback_without_stdout(self, mock_ghapi, mock_auth, capsys):
+        """Transport failures may fall back to REST, but should never print to stdout."""
+        mock_ghapi_instance = Mock()
+        mock_ghapi_instance.graphql.query.side_effect = Exception("socket error")
+        mock_ghapi.return_value = mock_ghapi_instance
+
+        mock_repo = Mock()
+        mock_repo.id = 1
+        mock_repo.full_name = "user/repo"
+        mock_repo.name = "repo"
+        mock_repo.owner.login = "user"
+        mock_repo.description = "Test"
+        mock_repo.stargazers_count = 100
+        mock_repo.forks_count = 10
+        mock_repo.watchers_count = 50
+        mock_repo.language = "Python"
+        mock_repo.archived = False
+        mock_repo.private = False
+        mock_repo.fork = False
+        mock_repo.created_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        mock_repo.updated_at = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        mock_repo.pushed_at = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        mock_repo.html_url = "https://github.com/user/repo"
+        mock_repo.clone_url = "https://github.com/user/repo.git"
+        mock_repo.homepage = None
+        mock_repo.default_branch = "main"
+        mock_repo.license = None
+
+        mock_user = Mock()
+        mock_user.get_starred.return_value = [mock_repo]
+        mock_auth.get_github_client.return_value.get_user.return_value = mock_user
+
+        client = GitHubAPIClient(mock_auth)
         repos = client._get_starred_graphql()
-        assert isinstance(repos, list)  # Should not crash
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert len(repos) == 1
 
     @patch("ganger.core.github_client.GhApi")
     def test_graphql_handles_malformed_response(self, mock_ghapi, mock_auth):

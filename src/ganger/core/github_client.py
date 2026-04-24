@@ -7,11 +7,11 @@ Modified: 2025-11-07
 """
 
 import base64
+import logging
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 from github import Github, GithubException
-from github.Repository import Repository
 from ghapi.all import GhApi
 
 from ganger.core.auth import GitHubAuth
@@ -23,6 +23,9 @@ from ganger.core.exceptions import (
     AuthenticationError,
 )
 from ganger.utils.rate_limiter import RateLimiter
+
+
+logger = logging.getLogger(__name__)
 
 
 class GitHubAPIClient:
@@ -86,18 +89,15 @@ class GitHubAPIClient:
                 if max_count and i >= max_count:
                     break
 
-                # Get starred_at timestamp if available
-                starred_at = None
-                try:
-                    # PyGithub doesn't directly expose starred_at, but we can approximate
-                    starred_at = datetime.now()  # Fallback to now
-                except Exception:
-                    pass
-
-                starred_repo = StarredRepo.from_github_response(repo, starred_at=starred_at)
+                # REST does not expose starred_at; leave it unset instead of inventing a value.
+                starred_repo = StarredRepo.from_github_response(
+                    repo,
+                    starred_at=None,
+                    include_topics=False,
+                )
                 repos.append(starred_repo)
 
-                self.rate_limiter.track_request("list_starred")
+            self.rate_limiter.track_request("list_starred")
 
             return repos
 
@@ -160,6 +160,28 @@ class GitHubAPIClient:
             while has_next_page:
                 variables = {"cursor": cursor} if cursor else {}
                 result = self.graphql_api.graphql.query(query, variables=variables)
+
+                if not isinstance(result, dict):
+                    raise GangerError("GitHub GraphQL response was not a JSON object")
+
+                errors = result.get("errors", [])
+                if errors:
+                    error_messages = ", ".join(
+                        error.get("message", "Unknown GraphQL error") for error in errors
+                    )
+                    if any(
+                        error.get("type") == "RATE_LIMITED"
+                        or "rate limit" in error.get("message", "").lower()
+                        for error in errors
+                    ):
+                        raise RateLimitExceededError(error_messages)
+                    if any("bad credentials" in error.get("message", "").lower() for error in errors):
+                        raise AuthenticationError("GitHub authentication failed")
+                    raise GangerError(f"GitHub GraphQL error: {error_messages}")
+
+                if "viewer" not in result:
+                    logger.warning("GitHub GraphQL response missing 'viewer'; returning partial result")
+                    return repos
 
                 data = result.get("viewer", {}).get("starredRepositories", {})
                 edges = data.get("edges", [])
@@ -232,9 +254,11 @@ class GitHubAPIClient:
 
             return repos
 
+        except (AuthenticationError, GangerError, RateLimitExceededError):
+            raise
         except Exception as e:
             # Fallback to REST if GraphQL fails
-            print(f"⚠ GraphQL query failed ({e}), falling back to REST API")
+            logger.warning("GraphQL query failed, falling back to REST API: %s", e)
             return self._get_starred_rest()
 
     def get_repo(self, full_name: str) -> StarredRepo:
@@ -384,10 +408,10 @@ class GitHubAPIClient:
             for i, repo in enumerate(results):
                 if i >= max_results:
                     break
-                starred_repo = StarredRepo.from_github_response(repo)
+                starred_repo = StarredRepo.from_github_response(repo, include_topics=False)
                 repos.append(starred_repo)
 
-            self.rate_limiter.track_request("search", count=len(repos))
+            self.rate_limiter.track_request("search")
             return repos
 
         except GithubException as e:
@@ -406,12 +430,17 @@ class GitHubAPIClient:
             rate_limit = self.rest_api.get_rate_limit()
             core = rate_limit.core
 
-            return {
+            status = {
                 "limit": core.limit,
                 "remaining": core.remaining,
                 "reset": core.reset.isoformat() if core.reset else None,
                 "used": core.limit - core.remaining,
             }
+            self.rate_limiter.hourly_quota = status["limit"]
+            self.rate_limiter.quota_used = status["used"]
+            self.rate_limiter.reset_time = core.reset
+            self.rate_limiter.last_check = datetime.now()
+            return status
         except Exception as e:
             return {"error": str(e)}
 

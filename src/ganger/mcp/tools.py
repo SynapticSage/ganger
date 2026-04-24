@@ -310,13 +310,17 @@ async def _handle_tool_call(
                 repos = await asyncio.to_thread(
                     github.get_starred_repos, max_count=max_count
                 )
-                await cache.set_starred_repos(repos)
+                if max_count is None:
+                    await cache.set_starred_repos(repos)
+            elif max_count is not None:
+                repos = repos[:max_count]
         else:
             # Force refresh from GitHub (run in thread to avoid blocking)
             repos = await asyncio.to_thread(
                 github.get_starred_repos, max_count=max_count
             )
-            await cache.set_starred_repos(repos)
+            if max_count is None:
+                await cache.set_starred_repos(repos)
 
         return {
             "count": len(repos),

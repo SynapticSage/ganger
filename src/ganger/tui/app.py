@@ -54,6 +54,7 @@ logger = logging.getLogger(__name__)
 class GangerApp(App):
     """Main application class for Ganger."""
 
+    DEFAULT_CONFIG_DIR = Path.home() / ".config" / "ganger"
     CSS_PATH = "app.tcss"
     TITLE = "Ganger"
     SUB_TITLE = "GitHub Stars Manager"
@@ -90,7 +91,7 @@ class GangerApp(App):
         """
         super().__init__()
 
-        self.config_dir = config_dir or Path.home() / ".config" / "ganger"
+        self.config_dir = config_dir or self.DEFAULT_CONFIG_DIR
         self.use_cache = use_cache
 
         # Core components (initialized in on_mount)
@@ -108,7 +109,7 @@ class GangerApp(App):
         self.folders_loaded: bool = False
 
         # Settings
-        self.settings = Settings.load()
+        self.settings = Settings.load(self.config_dir / "config.yaml")
 
         # Ranger command state
         self._pending_command: Optional[str] = None
@@ -119,6 +120,27 @@ class GangerApp(App):
         self.help_overlay: Optional[HelpOverlay] = None
         self.command_input: Optional[CommandInput] = None
         self.search_input: Optional[SearchInput] = None
+
+    def _resolve_config_path(self, path_value: str) -> Path:
+        """Resolve a configured path relative to the active config directory."""
+        resolved = Path(path_value).expanduser()
+        if resolved.is_absolute():
+            return resolved
+        return self.config_dir / resolved
+
+    def _resolve_cache_path(self) -> Path:
+        """Resolve the cache path, respecting custom config roots and overrides."""
+        default_cache_path = Settings().cache.db_path
+        if (
+            self.config_dir != self.DEFAULT_CONFIG_DIR
+            and self.settings.cache.db_path == default_cache_path
+        ):
+            return self.config_dir / "cache.db"
+        return self._resolve_config_path(self.settings.cache.db_path)
+
+    def _resolve_token_file(self) -> Path:
+        """Resolve the token file for this app instance."""
+        return self.config_dir / "token.json"
 
     def compose(self) -> ComposeResult:
         """Create the application layout."""
@@ -158,7 +180,7 @@ class GangerApp(App):
             await self._load_stylesheet()
 
             # Initialize cache FIRST (fast, required for offline mode)
-            cache_path = self.config_dir / "cache.db"
+            cache_path = self._resolve_cache_path()
             self.cache = PersistentCache(
                 db_path=cache_path,
                 ttl_seconds=self.settings.cache.repos_ttl
@@ -257,7 +279,12 @@ class GangerApp(App):
         """Setup GitHub API authentication."""
         try:
             # Use silent mode to suppress console output (we're in TUI)
-            self.auth = GitHubAuth(silent=True)
+            self.auth = GitHubAuth(
+                token_file=self._resolve_token_file(),
+                auth_method=self.settings.github.auth_method,
+                silent=True,
+                token=self.settings.github.token,
+            )
             # Run blocking authentication in thread pool to avoid blocking event loop
             await asyncio.to_thread(self.auth.authenticate)
             token = self.auth.get_token()

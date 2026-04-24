@@ -19,6 +19,7 @@ from ganger.core.github_client import GitHubAPIClient
 from ganger.core.cache import PersistentCache
 from ganger.core.folder_manager import FolderManager
 from ganger.core.exceptions import GangerError, AuthenticationError
+from ganger.config.settings import Settings
 
 
 class GangerMCPServer:
@@ -44,7 +45,11 @@ class GangerMCPServer:
         """
         # Initialize core components
         if auth is None:
-            auth = GitHubAuth()
+            settings = Settings.load()
+            auth = GitHubAuth(
+                auth_method=settings.github.auth_method,
+                token=settings.github.token,
+            )
             try:
                 auth.authenticate()
             except AuthenticationError as e:
@@ -101,12 +106,18 @@ def create_server(
 
 def main():
     """Main entry point for MCP server."""
+    settings = Settings.load()
+
     # Get cache path from env or use default
     cache_path_str = os.getenv("GANGER_CACHE_PATH")
-    cache_path = Path(cache_path_str) if cache_path_str else None
+    if cache_path_str:
+        cache_path = Path(cache_path_str).expanduser()
+    else:
+        configured_cache_path = Path(settings.cache.db_path).expanduser()
+        cache_path = configured_cache_path
 
     # Get cache TTL from env or use default
-    cache_ttl = int(os.getenv("GANGER_CACHE_TTL", "3600"))
+    cache_ttl = int(os.getenv("GANGER_CACHE_TTL", str(settings.cache.repos_ttl)))
 
     server = create_server(cache_path=cache_path, cache_ttl=cache_ttl)
     server.run()

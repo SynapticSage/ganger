@@ -57,7 +57,12 @@ class StarredRepo:
     is_focused: bool = False
 
     @classmethod
-    def from_github_response(cls, repo: Any, starred_at: Optional[datetime] = None) -> "StarredRepo":
+    def from_github_response(
+        cls,
+        repo: Any,
+        starred_at: Optional[datetime] = None,
+        include_topics: bool = True,
+    ) -> "StarredRepo":
         """
         Create a StarredRepo from PyGithub's Repository object.
 
@@ -78,7 +83,7 @@ class StarredRepo:
             forks_count=repo.forks_count or 0,
             watchers_count=repo.watchers_count or 0,
             language=repo.language,
-            topics=repo.get_topics() if hasattr(repo, "get_topics") else [],
+            topics=repo.get_topics() if include_topics and hasattr(repo, "get_topics") else [],
             is_archived=repo.archived,
             is_private=repo.private,
             is_fork=repo.fork,
@@ -203,6 +208,10 @@ class VirtualFolder:
         """Create from dictionary (e.g., from cache)."""
         import json
 
+        repo_count = data.get("repo_count", 0)
+        is_selected = data.get("is_selected", False)
+        is_focused = data.get("is_focused", False)
+
         # Parse auto_tags if it's a JSON string
         if "auto_tags" in data and isinstance(data["auto_tags"], str):
             data["auto_tags"] = json.loads(data["auto_tags"])
@@ -217,7 +226,12 @@ class VirtualFolder:
         data.pop("is_selected", None)
         data.pop("is_focused", None)
 
-        return cls(**data)
+        return cls(
+            repo_count=repo_count,
+            is_selected=is_selected,
+            is_focused=is_focused,
+            **data,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""

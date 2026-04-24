@@ -75,6 +75,10 @@ class FolderColumn(ScrollableContainer):
     async def set_folders(self, folders: List[VirtualFolder]) -> None:
         """Set the folders to display."""
         self.folders = folders
+        if self.folders:
+            self.selected_index = min(self.selected_index, len(self.folders) - 1)
+        else:
+            self.selected_index = 0
         await self.refresh_display()
 
     async def refresh_display(self) -> None:
@@ -218,7 +222,16 @@ class RepoColumn(ScrollableContainer):
     async def set_repos(self, repos: List[StarredRepo]) -> None:
         """Set the repos to display."""
         self.repos = repos
+        visible_repo_ids = {repo.id for repo in repos}
+        self.marked_repos &= visible_repo_ids
+        if self.repos:
+            self.selected_index = min(self.selected_index, len(self.repos) - 1)
+        else:
+            self.selected_index = 0
         await self.refresh_display()
+        self.post_message(SelectionChanged(len(self.marked_repos)))
+        if self.repos and 0 <= self.selected_index < len(self.repos):
+            self.post_message(RepoSelected(self.repos[self.selected_index]))
 
     async def refresh_display(self) -> None:
         """Refresh the repo display."""

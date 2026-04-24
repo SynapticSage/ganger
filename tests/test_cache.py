@@ -140,6 +140,45 @@ class TestStarredReposOperations:
         repos = await cache.get_starred_repos()
         assert repos is None
 
+    @pytest.mark.asyncio
+    async def test_set_starred_repos_preserves_existing_folder_links(
+        self, cache, sample_repos, sample_folder
+    ):
+        """Refreshing cached repos should not drop folder membership for retained repos."""
+        await cache.set_starred_repos(sample_repos)
+        await cache.create_virtual_folder(sample_folder)
+        await cache.add_repo_to_folder(sample_repos[0].id, sample_folder.id)
+
+        refreshed_repo = StarredRepo(
+            id=sample_repos[0].id,
+            full_name=sample_repos[0].full_name,
+            name=sample_repos[0].name,
+            owner=sample_repos[0].owner,
+            description=sample_repos[0].description,
+            stars_count=sample_repos[0].stars_count + 100,
+            language=sample_repos[0].language,
+            topics=sample_repos[0].topics,
+        )
+        await cache.set_starred_repos([refreshed_repo, sample_repos[1]])
+
+        folder_repos = await cache.get_folder_repos(sample_folder.id)
+        assert [repo.id for repo in folder_repos] == [sample_repos[0].id]
+        assert folder_repos[0].stars_count == sample_repos[0].stars_count + 100
+
+    @pytest.mark.asyncio
+    async def test_set_starred_repos_prunes_stale_folder_links(
+        self, cache, sample_repos, sample_folder
+    ):
+        """Repos removed from the cache snapshot should be removed from folder links too."""
+        await cache.set_starred_repos(sample_repos)
+        await cache.create_virtual_folder(sample_folder)
+        await cache.add_repo_to_folder(sample_repos[0].id, sample_folder.id)
+
+        await cache.set_starred_repos([sample_repos[1]])
+
+        folder_repos = await cache.get_folder_repos(sample_folder.id)
+        assert folder_repos == []
+
 
 class TestVirtualFoldersOperations:
     """Test virtual folders operations."""
@@ -196,6 +235,18 @@ class TestVirtualFoldersOperations:
         folder_repos = await cache.get_folder_repos(sample_folder.id)
         assert len(folder_repos) == 1
         assert folder_repos[0].full_name == "octocat/Hello-World"
+
+    @pytest.mark.asyncio
+    async def test_get_virtual_folders_reports_repo_count(self, cache, sample_repos, sample_folder):
+        """Folder summaries should include the current repo count."""
+        await cache.set_starred_repos(sample_repos)
+        await cache.create_virtual_folder(sample_folder)
+        await cache.add_repo_to_folder(sample_repos[0].id, sample_folder.id)
+
+        folders = await cache.get_virtual_folders()
+
+        assert len(folders) == 1
+        assert folders[0].repo_count == 1
 
     @pytest.mark.asyncio
     async def test_remove_repo_from_folder(self, cache, sample_repos, sample_folder):
