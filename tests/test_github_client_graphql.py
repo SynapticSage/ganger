@@ -65,6 +65,57 @@ class TestGraphQLBulkFetch:
         mock_ghapi_instance.graphql.query.assert_called_once()
 
     @patch("ganger.core.github_client.GhApi")
+    def test_graphql_supports_direct_endpoint_shape(self, mock_ghapi, mock_auth):
+        """Production ghapi returns a top-level `data` payload from `/graphql`."""
+        response = {
+            "data": MockGraphQLResponse.create_starred_response([
+                {
+                    "id": "R_1",
+                    "nameWithOwner": "python/cpython",
+                    "stargazerCount": 50000,
+                }
+            ], has_next_page=False)
+        }
+
+        class DirectGraphQLClient:
+            def __call__(self, path, verb=None, data=None):
+                assert path == "/graphql"
+                assert verb == "POST"
+                assert "query" in data
+                return response
+
+        mock_ghapi.return_value = DirectGraphQLClient()
+
+        client = GitHubAPIClient(mock_auth)
+        repos = client._get_starred_graphql()
+
+        assert len(repos) == 1
+        assert repos[0].full_name == "python/cpython"
+
+    @patch("ganger.core.github_client.GhApi")
+    def test_graphql_page_fetch_reports_total_count(self, mock_ghapi, mock_auth):
+        """Single-page fetches should expose page metadata for incremental sync."""
+        response = MockGraphQLResponse.create_starred_response([
+            {
+                "id": "R_1",
+                "nameWithOwner": "python/cpython",
+                "stargazerCount": 50000,
+            }
+        ], has_next_page=False)
+        response["viewer"]["starredRepositories"]["totalCount"] = 1575
+
+        mock_ghapi_instance = Mock()
+        mock_ghapi_instance.graphql.query.return_value = response
+        mock_ghapi.return_value = mock_ghapi_instance
+
+        client = GitHubAPIClient(mock_auth)
+        page = client.get_starred_repos_page()
+
+        assert page["total_count"] == 1575
+        assert page["has_next_page"] is False
+        assert len(page["repos"]) == 1
+
+    @patch("ganger.core.github_client.GhApi")
     def test_graphql_pagination_multiple_pages(self, mock_ghapi, mock_auth):
         """Test GraphQL pagination across multiple pages."""
         # Setup: Mock paginated responses
@@ -94,7 +145,7 @@ class TestGraphQLBulkFetch:
 
         # Verify cursor was passed
         second_call_vars = mock_ghapi_instance.graphql.query.call_args_list[1][1]["variables"]
-        assert second_call_vars == {"cursor": "cursor_page2"}
+        assert second_call_vars == {"pageSize": 100, "cursor": "cursor_page2"}
 
     @patch("ganger.core.github_client.GhApi")
     def test_graphql_empty_response(self, mock_ghapi, mock_auth):

@@ -249,6 +249,29 @@ class TestVirtualFoldersOperations:
         assert folders[0].repo_count == 1
 
     @pytest.mark.asyncio
+    async def test_all_stars_repo_count_comes_from_starred_repo_cache(self, cache, sample_repos):
+        """The special All Stars folder should reflect cached repos immediately."""
+        all_stars = VirtualFolder(id="all-stars", name="All Stars")
+        await cache.create_virtual_folder(all_stars)
+        await cache.set_starred_repos(sample_repos)
+
+        folders = await cache.get_virtual_folders()
+
+        assert len(folders) == 1
+        assert folders[0].repo_count == len(sample_repos)
+
+    @pytest.mark.asyncio
+    async def test_all_stars_reads_repos_without_folder_links(self, cache, sample_repos):
+        """All Stars should not depend on `folder_repos` rows to show cached stars."""
+        all_stars = VirtualFolder(id="all-stars", name="All Stars")
+        await cache.create_virtual_folder(all_stars)
+        await cache.set_starred_repos(sample_repos)
+
+        repos = await cache.get_folder_repos("all-stars")
+
+        assert [repo.id for repo in repos] == [sample_repos[0].id, sample_repos[1].id]
+
+    @pytest.mark.asyncio
     async def test_remove_repo_from_folder(self, cache, sample_repos, sample_folder):
         """Test removing repos from folders."""
         await cache.set_starred_repos(sample_repos)

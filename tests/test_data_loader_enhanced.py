@@ -129,6 +129,54 @@ class TestLoadStarredRepos:
         # rust-lang/rust (id="3") has highest stars
         assert cached_repos[0].id == "3"
 
+    @pytest.mark.asyncio
+    async def test_incremental_graphql_sync_updates_cache_by_page(
+        self, temp_cache, mock_settings, sample_repos
+    ):
+        """GraphQL page fetches should populate the cache incrementally."""
+
+        class IncrementalAPI:
+            def __init__(self, repos):
+                self._pages = [
+                    {
+                        "repos": [repos[0], repos[1]],
+                        "total_count": len(repos),
+                        "has_next_page": True,
+                        "end_cursor": "page-2",
+                    },
+                    {
+                        "repos": repos[2:],
+                        "total_count": len(repos),
+                        "has_next_page": False,
+                        "end_cursor": None,
+                    },
+                ]
+
+            def get_starred_repos_page(self, cursor=None):
+                if cursor is None:
+                    return self._pages[0]
+                assert cursor == "page-2"
+                return self._pages[1]
+
+        folder_manager = AsyncMock()
+        repo_sync_callback = AsyncMock()
+        loader = DataLoader(
+            IncrementalAPI(sample_repos),
+            temp_cache,
+            folder_manager,
+            mock_settings,
+            repo_sync_callback=repo_sync_callback,
+        )
+
+        repos = await loader.load_starred_repos(force_refresh=True)
+        cached_repos = await temp_cache.get_starred_repos()
+
+        assert len(repos) == len(sample_repos)
+        assert len(cached_repos) == len(sample_repos)
+        assert repo_sync_callback.await_count == 2
+        assert repo_sync_callback.await_args_list[0].args == (2, len(sample_repos))
+        assert repo_sync_callback.await_args_list[1].args == (len(sample_repos), len(sample_repos))
+
 
 @pytest.mark.integration
 class TestDefaultFolders:
@@ -392,42 +440,31 @@ class TestDataLoaderErrorPaths:
 
     @pytest.mark.asyncio
     async def test_sync_all_stars_handles_get_folder_error(self, temp_cache, mock_settings, sample_repos):
-        """Test that sync_all_stars_folder handles errors when fetching current repos."""
-        # Setup: Mock cache that raises error on get_folder_repos
+        """All Stars sync should not touch folder link rows anymore."""
         mock_cache = AsyncMock()
-        mock_cache.get_folder_repos.side_effect = Exception("Folder not found")
         mock_cache.add_repo_to_folder = AsyncMock()
 
         mock_api = Mock()
         folder_manager = AsyncMock()
         loader = DataLoader(mock_api, mock_cache, folder_manager, mock_settings)
 
-        # Execute: Should not crash, should still try to add repos
         await loader.sync_all_stars_folder(sample_repos)
 
-        # Verify: Attempted to add all repos (since current_repo_ids is empty)
-        assert mock_cache.add_repo_to_folder.call_count == len(sample_repos)
+        mock_cache.add_repo_to_folder.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_sync_all_stars_handles_add_repo_error(self, temp_cache, mock_settings, sample_repos):
-        """Test that sync_all_stars_folder handles errors when adding repos."""
-        # Setup: Mock cache that raises error on add_repo_to_folder
+        """All Stars sync remains a no-op even if cache mocks are hostile."""
         mock_cache = AsyncMock()
-        mock_cache.get_folder_repos.return_value = []
-        from ganger.core.exceptions import CacheError
-        mock_cache.add_repo_to_folder.side_effect = CacheError("Repo already in folder")
+        mock_cache.add_repo_to_folder.side_effect = RuntimeError("should not be called")
 
         mock_api = Mock()
         folder_manager = AsyncMock()
         loader = DataLoader(mock_api, mock_cache, folder_manager, mock_settings)
 
-        # Execute: Should not crash (logs error but doesn't raise)
         await loader.sync_all_stars_folder(sample_repos)
 
-        # Verify: Called once before exception caught the entire sync
-        # NOTE: Current implementation catches exception at function level, not per-repo
-        # This means only first repo is attempted before sync stops
-        assert mock_cache.add_repo_to_folder.call_count == 1
+        mock_cache.add_repo_to_folder.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_auto_categorize_handles_folder_manager_error(self, temp_cache, sample_repos):

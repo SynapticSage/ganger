@@ -13,6 +13,30 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 
+DEFAULT_FOLDER_DEFINITIONS: List[Dict[str, Any]] = [
+    {
+        "name": "Python Projects",
+        "auto_tags": ["python", "py"],
+    },
+    {
+        "name": "JavaScript/TypeScript",
+        "auto_tags": ["javascript", "typescript", "js", "ts", "nodejs"],
+    },
+    {
+        "name": "AI/ML",
+        "auto_tags": ["machine-learning", "ai", "deep-learning", "ml", "artificial-intelligence"],
+    },
+    {
+        "name": "DevOps",
+        "auto_tags": ["docker", "kubernetes", "ci-cd", "devops", "terraform"],
+    },
+    {
+        "name": "Web Development",
+        "auto_tags": ["web", "frontend", "backend", "fullstack"],
+    },
+]
+
+
 @dataclass
 class GitHubSettings:
     """GitHub API settings."""
@@ -48,7 +72,9 @@ class FolderConfig:
 class FolderSettings:
     """Folder management settings."""
 
-    default_folders: List[Dict[str, Any]] = field(default_factory=list)
+    default_folders: List[Dict[str, Any]] = field(
+        default_factory=lambda: [folder.copy() for folder in DEFAULT_FOLDER_DEFINITIONS]
+    )
 
 
 @dataclass
@@ -133,7 +159,10 @@ class Settings:
             if "folders" in config_data:
                 folders = config_data["folders"]
                 settings.folders = FolderSettings(
-                    default_folders=folders.get("default_folders", [])
+                    default_folders=folders.get(
+                        "default_folders",
+                        [folder.copy() for folder in DEFAULT_FOLDER_DEFINITIONS],
+                    )
                 )
 
             # Behavior settings

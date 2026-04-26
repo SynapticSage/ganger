@@ -294,60 +294,25 @@ class PersistentCache:
             repos: List of StarredRepo objects to cache
             prune_missing: Remove repos that are not present in this snapshot
         """
+        await self.upsert_starred_repos(repos)
+        if prune_missing:
+            await self.prune_starred_repos(repo.id for repo in repos)
+
+    async def upsert_starred_repos(self, repos: List[StarredRepo]) -> None:
+        """Insert or update a batch of cached starred repos without pruning."""
         async with self._connect() as db:
-            now = datetime.now().isoformat()
-            repo_ids = {repo.id for repo in repos}
+            await self._upsert_starred_repos(db, repos)
+            await db.commit()
+
+    async def prune_starred_repos(self, keep_repo_ids: Iterable[str]) -> None:
+        """Delete cached repos not present in the provided snapshot."""
+        async with self._connect() as db:
+            keep_repo_ids = tuple(dict.fromkeys(keep_repo_ids))
 
             cursor = await db.execute("SELECT id FROM starred_repos")
             existing_repo_ids = {row[0] for row in await cursor.fetchall()}
+            stale_repo_ids = existing_repo_ids - set(keep_repo_ids)
 
-            rows = []
-            for repo in repos:
-                data = repo.to_dict()
-                data["cached_at"] = now
-                data["accessed_at"] = now
-                rows.append(data)
-
-            if rows:
-                await db.executemany("""
-                    INSERT INTO starred_repos (
-                        id, full_name, name, owner, description, stars_count, forks_count,
-                        watchers_count, language, topics, is_archived, is_private, is_fork,
-                        created_at, updated_at, pushed_at, starred_at, url, clone_url,
-                        homepage, default_branch, license, cached_at, accessed_at
-                    ) VALUES (
-                        :id, :full_name, :name, :owner, :description, :stars_count, :forks_count,
-                        :watchers_count, :language, :topics, :is_archived, :is_private, :is_fork,
-                        :created_at, :updated_at, :pushed_at, :starred_at, :url, :clone_url,
-                        :homepage, :default_branch, :license, :cached_at, :accessed_at
-                    )
-                    ON CONFLICT(id) DO UPDATE SET
-                        full_name = excluded.full_name,
-                        name = excluded.name,
-                        owner = excluded.owner,
-                        description = excluded.description,
-                        stars_count = excluded.stars_count,
-                        forks_count = excluded.forks_count,
-                        watchers_count = excluded.watchers_count,
-                        language = excluded.language,
-                        topics = excluded.topics,
-                        is_archived = excluded.is_archived,
-                        is_private = excluded.is_private,
-                        is_fork = excluded.is_fork,
-                        created_at = excluded.created_at,
-                        updated_at = excluded.updated_at,
-                        pushed_at = excluded.pushed_at,
-                        starred_at = excluded.starred_at,
-                        url = excluded.url,
-                        clone_url = excluded.clone_url,
-                        homepage = excluded.homepage,
-                        default_branch = excluded.default_branch,
-                        license = excluded.license,
-                        cached_at = excluded.cached_at,
-                        accessed_at = excluded.accessed_at
-                """, rows)
-
-            stale_repo_ids = existing_repo_ids - repo_ids if prune_missing else set()
             if stale_repo_ids:
                 await self._delete_repo_metadata(db, stale_repo_ids)
                 placeholders = ", ".join("?" for _ in stale_repo_ids)
@@ -355,12 +320,66 @@ class PersistentCache:
                     f"DELETE FROM starred_repos WHERE id IN ({placeholders})",
                     tuple(stale_repo_ids),
                 )
-
-            if not repos and prune_missing:
+            elif not keep_repo_ids:
                 await db.execute("DELETE FROM starred_repos")
                 await db.execute("DELETE FROM repo_metadata")
 
             await db.commit()
+
+    @staticmethod
+    async def _upsert_starred_repos(
+        db: aiosqlite.Connection,
+        repos: List[StarredRepo],
+    ) -> None:
+        """Insert or update repo rows on an existing connection."""
+        now = datetime.now().isoformat()
+        rows = []
+        for repo in repos:
+            data = repo.to_dict()
+            data["cached_at"] = now
+            data["accessed_at"] = now
+            rows.append(data)
+
+        if not rows:
+            return
+
+        await db.executemany("""
+            INSERT INTO starred_repos (
+                id, full_name, name, owner, description, stars_count, forks_count,
+                watchers_count, language, topics, is_archived, is_private, is_fork,
+                created_at, updated_at, pushed_at, starred_at, url, clone_url,
+                homepage, default_branch, license, cached_at, accessed_at
+            ) VALUES (
+                :id, :full_name, :name, :owner, :description, :stars_count, :forks_count,
+                :watchers_count, :language, :topics, :is_archived, :is_private, :is_fork,
+                :created_at, :updated_at, :pushed_at, :starred_at, :url, :clone_url,
+                :homepage, :default_branch, :license, :cached_at, :accessed_at
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                full_name = excluded.full_name,
+                name = excluded.name,
+                owner = excluded.owner,
+                description = excluded.description,
+                stars_count = excluded.stars_count,
+                forks_count = excluded.forks_count,
+                watchers_count = excluded.watchers_count,
+                language = excluded.language,
+                topics = excluded.topics,
+                is_archived = excluded.is_archived,
+                is_private = excluded.is_private,
+                is_fork = excluded.is_fork,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                pushed_at = excluded.pushed_at,
+                starred_at = excluded.starred_at,
+                url = excluded.url,
+                clone_url = excluded.clone_url,
+                homepage = excluded.homepage,
+                default_branch = excluded.default_branch,
+                license = excluded.license,
+                cached_at = excluded.cached_at,
+                accessed_at = excluded.accessed_at
+        """, rows)
 
     async def get_repo(self, repo_id: str) -> Optional[StarredRepo]:
         """
@@ -416,11 +435,15 @@ class PersistentCache:
             for row in rows:
                 folder_dict = dict(row)
 
-                # Get repo count for this folder
-                count_cursor = await db.execute(
-                    "SELECT COUNT(*) as count FROM folder_repos WHERE folder_id = ?",
-                    (row["id"],),
-                )
+                if row["id"] == "all-stars":
+                    count_cursor = await db.execute(
+                        "SELECT COUNT(*) as count FROM starred_repos"
+                    )
+                else:
+                    count_cursor = await db.execute(
+                        "SELECT COUNT(*) as count FROM folder_repos WHERE folder_id = ?",
+                        (row["id"],),
+                    )
                 count_row = await count_cursor.fetchone()
                 folder_dict["repo_count"] = count_row["count"] if count_row else 0
 
@@ -487,6 +510,13 @@ class PersistentCache:
             List of StarredRepo objects in this folder
         """
         async with self._connect(row_factory=aiosqlite.Row) as db:
+            if folder_id == "all-stars":
+                cursor = await db.execute("""
+                    SELECT * FROM starred_repos
+                    ORDER BY stars_count DESC
+                """)
+                rows = await cursor.fetchall()
+                return [StarredRepo.from_dict(dict(row)) for row in rows]
 
             cursor = await db.execute("""
                 SELECT r.* FROM starred_repos r

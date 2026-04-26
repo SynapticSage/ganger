@@ -173,6 +173,37 @@ class GangerApp(App):
         self.help_overlay = HelpOverlay()
         yield self.help_overlay
 
+    async def _ensure_default_folders_local(self) -> None:
+        """Ensure default folders exist without waiting for GitHub sync."""
+        if not self.cache or not self.folder_manager:
+            return
+
+        from ..core.data_loader import DataLoader
+
+        # `ensure_default_folders` only touches cache/settings, so api_client is unused here.
+        loader = DataLoader(
+            api_client=None,  # type: ignore[arg-type]
+            cache=self.cache,
+            folder_manager=self.folder_manager,
+            settings=self.settings,
+        )
+        await loader.ensure_default_folders()
+
+    def _select_folder(self, folder_id: Optional[str] = None) -> None:
+        """Select a folder by id, or fall back to the first folder."""
+        if not self.miller_view or not self.miller_view.folder_column or not self.folders:
+            return
+
+        selected_index = 0
+        if folder_id is not None:
+            for i, folder in enumerate(self.folders):
+                if folder.id == folder_id:
+                    selected_index = i
+                    break
+
+        self.miller_view.folder_column.selected_index = selected_index
+        self.post_message(FolderSelected(self.folders[selected_index]))
+
     async def on_mount(self) -> None:
         """Initialize the application after mounting."""
         try:
@@ -216,13 +247,14 @@ class GangerApp(App):
     async def _load_cached_data(self) -> None:
         """Load cached folders/repos for immediate display."""
         try:
-            # Load folders from cache (fast)
-            await self.load_folders()
+            # Ensure the local folder skeleton exists even before GitHub sync.
+            await self._ensure_default_folders_local()
 
-            # If we have folders, select the first one
-            if self.miller_view and self.miller_view.folder_column and self.folders:
-                self.miller_view.folder_column.selected_index = 0
-                self.post_message(FolderSelected(self.folders[0]))
+            # Load folders from cache (fast)
+            await self.load_folders(update_status=False)
+
+            # If we have folders, select the current or first one.
+            self._select_folder(self.current_folder.id if self.current_folder else None)
 
             if self.status_bar:
                 self.status_bar.update_status("Loading...", "")
@@ -278,6 +310,9 @@ class GangerApp(App):
     async def setup_authentication(self) -> None:
         """Setup GitHub API authentication."""
         try:
+            if self.status_bar:
+                self.status_bar.update_status("Authenticating with GitHub...", "")
+
             # Use silent mode to suppress console output (we're in TUI)
             self.auth = GitHubAuth(
                 token_file=self._resolve_token_file(),
@@ -335,7 +370,16 @@ class GangerApp(App):
                 self.folder_manager,
                 self.settings,
                 progress_callback=self._on_progress,
+                repo_sync_callback=self._on_repo_sync_progress,
             )
+
+            # Ensure default folders exist
+            folders = await loader.ensure_default_folders()
+            logger.info(f"Ensured {len(folders)} default folders exist")
+
+            # Load the folder skeleton into the UI before the full repo sync completes.
+            await self.load_folders(update_status=False)
+            self._select_folder(self.current_folder.id if self.current_folder else None)
 
             # Load starred repos (from cache or API)
             repos = await loader.load_starred_repos(force_refresh=force_refresh)
@@ -343,18 +387,9 @@ class GangerApp(App):
             if self.status_bar:
                 self.status_bar.update_status(f"Loaded {len(repos)} repos", "")
 
-            # Ensure default folders exist
-            folders = await loader.ensure_default_folders()
-            logger.info(f"Ensured {len(folders)} default folders exist")
-
-            # Load folders into UI first (fast - improves perceived performance)
-            await self.load_folders()
-
-            # Auto-select first folder to show repos immediately
-            if self.miller_view and self.miller_view.folder_column:
-                self.miller_view.folder_column.selected_index = 0
-                if self.folders:
-                    self.post_message(FolderSelected(self.folders[0]))
+            # Refresh the folder list and reload the current selection now that repo data is cached.
+            await self.load_folders(update_status=False)
+            self._select_folder(self.current_folder.id if self.current_folder else None)
 
             # Show ready status early
             if self.status_bar:
@@ -370,7 +405,7 @@ class GangerApp(App):
                 if self.settings.behavior.auto_categorize:
                     await loader.auto_categorize_all(repos)
                 # Refresh folders after sync
-                await self.load_folders()
+                await self.load_folders(update_status=False)
                 if self.status_bar:
                     self.status_bar.clear_progress()
 
@@ -390,6 +425,29 @@ class GangerApp(App):
         if self.status_bar:
             self.status_bar.show_progress(label, current, total)
 
+    async def _on_repo_sync_progress(
+        self,
+        cached_count: int,
+        total_count: Optional[int],
+    ) -> None:
+        """Refresh folder counts and `All Stars` contents during an incremental sync."""
+        if self.status_bar:
+            if total_count is not None:
+                self.status_bar.update_status(
+                    f"Syncing with GitHub... {cached_count}/{total_count}",
+                    "",
+                )
+            else:
+                self.status_bar.update_status(
+                    f"Syncing with GitHub... {cached_count}",
+                    "",
+                )
+
+        await self.load_folders(update_status=False)
+
+        if self.current_folder and self.current_folder.id == "all-stars":
+            await self._refresh_current_folder()
+
     async def _deferred_sync(self, loader, repos) -> None:
         """Run deferred sync operations in background.
 
@@ -408,7 +466,7 @@ class GangerApp(App):
                 await loader.auto_categorize_all(repos)
 
             # Refresh folders to show updated counts
-            await self.load_folders()
+            await self.load_folders(update_status=False)
 
             # Clear progress and restore hints
             if self.status_bar:
@@ -422,7 +480,21 @@ class GangerApp(App):
             if self.status_bar:
                 self.status_bar.clear_progress()
 
-    async def load_folders(self) -> None:
+    async def _refresh_current_folder(self) -> None:
+        """Refresh the repo pane for the currently selected folder."""
+        if not self.current_folder or not self.folder_manager or not self.miller_view:
+            return
+
+        self.current_repos = await self.folder_manager.get_folder_repos(self.current_folder.id)
+        await self.miller_view.set_repos(self.current_repos)
+
+        if self.status_bar:
+            self.status_bar.update_context(
+                f"{self.current_folder.name} ({len(self.current_repos)})",
+                selected_count=self.miller_view.get_marked_count(),
+            )
+
+    async def load_folders(self, update_status: bool = True) -> None:
         """Load virtual folders and starred repos."""
         try:
             if not self.folder_manager:
@@ -438,7 +510,7 @@ class GangerApp(App):
 
             self.folders_loaded = True
 
-            if self.status_bar:
+            if self.status_bar and update_status:
                 self.status_bar.update_status(
                     f"Loaded {len(self.folders)} folders",
                     ""

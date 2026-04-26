@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 # Type alias for progress callback: (label, current, total) -> None
 ProgressCallback = Callable[[str, int, int], Awaitable[None]]
+RepoSyncCallback = Callable[[int, Optional[int]], Awaitable[None]]
 
 
 class DataLoader:
@@ -32,6 +33,7 @@ class DataLoader:
         folder_manager: FolderManager,
         settings: Settings,
         progress_callback: Optional[ProgressCallback] = None,
+        repo_sync_callback: Optional[RepoSyncCallback] = None,
     ):
         """Initialize data loader.
 
@@ -41,12 +43,15 @@ class DataLoader:
             folder_manager: Folder manager
             settings: Application settings
             progress_callback: Optional async callback(label, current, total) for progress
+            repo_sync_callback: Optional async callback(cached_count, total_count)
+                                fired as repo pages are written to cache
         """
         self.api_client = api_client
         self.cache = cache
         self.folder_manager = folder_manager
         self.settings = settings
         self.progress_callback = progress_callback
+        self.repo_sync_callback = repo_sync_callback
 
     async def _report_progress(self, label: str, current: int, total: int) -> None:
         """Report progress if callback is set."""
@@ -55,6 +60,14 @@ class DataLoader:
                 await self.progress_callback(label, current, total)
             except Exception as e:
                 logger.warning(f"Progress callback failed: {e}")
+
+    async def _report_repo_sync(self, cached_count: int, total_count: Optional[int]) -> None:
+        """Report incremental repo-cache updates if a callback is set."""
+        if self.repo_sync_callback:
+            try:
+                await self.repo_sync_callback(cached_count, total_count)
+            except Exception as e:
+                logger.warning(f"Repo sync callback failed: {e}")
 
     async def load_starred_repos(self, force_refresh: bool = False) -> List[StarredRepo]:
         """Load starred repos from cache or GitHub API.
@@ -73,14 +86,29 @@ class DataLoader:
                     logger.info(f"Loaded {len(cached_repos)} repos from cache")
                     return cached_repos
 
-            # Fetch from GitHub API (run in thread pool to avoid blocking)
-            logger.info("Fetching starred repos from GitHub API...")
-            repos = await asyncio.to_thread(self.api_client.get_starred_repos)
+            used_incremental_cache = False
+            if hasattr(type(self.api_client), "get_starred_repos_page"):
+                try:
+                    logger.info("Fetching starred repos from GitHub API incrementally...")
+                    repos = await self._load_starred_repos_incrementally()
+                    used_incremental_cache = True
+                except Exception as incremental_error:
+                    logger.warning(
+                        "Incremental starred repo sync failed, falling back to full fetch: %s",
+                        incremental_error,
+                    )
+                    repos = await asyncio.to_thread(self.api_client.get_starred_repos)
+            else:
+                # Fetch from GitHub API (run in thread pool to avoid blocking)
+                logger.info("Fetching starred repos from GitHub API...")
+                repos = await asyncio.to_thread(self.api_client.get_starred_repos)
 
             logger.info(f"Fetched {len(repos)} starred repos from GitHub")
 
-            # Store in cache
-            await self.cache.set_starred_repos(repos)
+            if not used_incremental_cache:
+                # Incremental GraphQL sync populates the cache as it goes.
+                await self.cache.set_starred_repos(repos)
+                await self._report_repo_sync(len(repos), len(repos))
 
             return repos
 
@@ -92,6 +120,39 @@ class DataLoader:
                 logger.warning(f"Using {len(cached_repos)} repos from cache (API failed)")
                 return cached_repos
             raise
+
+    async def _load_starred_repos_incrementally(self) -> List[StarredRepo]:
+        """Fetch starred repos page by page so the TUI can update mid-sync."""
+        repos: List[StarredRepo] = []
+        repo_ids = set()
+        cursor: Optional[str] = None
+        total_count: Optional[int] = None
+
+        while True:
+            page = await asyncio.to_thread(
+                self.api_client.get_starred_repos_page,
+                cursor,
+            )
+
+            page_repos = page["repos"]
+            total_count = page.get("total_count")
+
+            if page_repos:
+                await self.cache.upsert_starred_repos(page_repos)
+                repos.extend(page_repos)
+                repo_ids.update(repo.id for repo in page_repos)
+
+            if total_count and total_count > 0:
+                await self._report_progress("Syncing", len(repo_ids), total_count)
+            await self._report_repo_sync(len(repo_ids), total_count)
+
+            if not page["has_next_page"]:
+                break
+
+            cursor = page["end_cursor"]
+
+        await self.cache.prune_starred_repos(repo_ids)
+        return repos
 
     async def ensure_default_folders(self) -> List[VirtualFolder]:
         """Create default folders if they don't exist.
@@ -153,41 +214,16 @@ class DataLoader:
             raise
 
     async def sync_all_stars_folder(self, all_repos: List[StarredRepo]) -> None:
-        """Ensure All Stars folder contains all repos.
+        """Refresh progress for the special All Stars folder.
 
         Args:
             all_repos: All starred repositories
         """
         try:
-            all_stars_id = "all-stars"
             total = len(all_repos)
-
-            # Get current repos in All Stars
-            current_repo_ids = set()
-            try:
-                current_repos = await self.cache.get_folder_repos(all_stars_id)
-                current_repo_ids = {r["id"] for r in current_repos}
-            except Exception:
-                # Folder might not exist yet
-                pass
-
-            # Add any missing repos with progress reporting
-            added = 0
-            for i, repo in enumerate(all_repos):
-                if repo.id not in current_repo_ids:
-                    await self.cache.add_repo_to_folder(
-                        repo_id=repo.id,
-                        folder_id=all_stars_id,
-                        is_manual=False,  # Auto-managed
-                    )
-                    added += 1
-
-                # Report progress every 10 repos or at the end
-                if (i + 1) % 10 == 0 or i == total - 1:
-                    await self._report_progress("Syncing", i + 1, total)
-
-            if added > 0:
-                logger.info(f"Added {added} repos to 'All Stars' folder")
+            if total > 0:
+                await self._report_progress("Syncing", total, total)
+            logger.info("All Stars uses the starred repo cache directly; no folder sync needed")
 
         except Exception as e:
             logger.error(f"Error syncing All Stars folder: {e}", exc_info=True)

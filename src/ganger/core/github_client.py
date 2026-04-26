@@ -111,10 +111,37 @@ class GitHubAPIClient:
 
     def _get_starred_graphql(self) -> List[StarredRepo]:
         """Get starred repos using GraphQL (faster for bulk operations)."""
+        repos = []
+        cursor = None
+        has_next_page = True
+
+        try:
+            while has_next_page:
+                page = self.get_starred_repos_page(cursor=cursor)
+                repos.extend(page["repos"])
+                has_next_page = page["has_next_page"]
+                cursor = page["end_cursor"]
+
+            return repos
+
+        except (AuthenticationError, GangerError, RateLimitExceededError):
+            raise
+        except Exception as e:
+            # Fallback to REST if GraphQL fails
+            logger.warning("GraphQL query failed, falling back to REST API: %s", e)
+            return self._get_starred_rest()
+
+    def get_starred_repos_page(
+        self,
+        cursor: Optional[str] = None,
+        page_size: int = 100,
+    ) -> Dict[str, Any]:
+        """Fetch a single GraphQL page of starred repositories."""
         query = """
-        query($cursor: String) {
+        query($cursor: String, $pageSize: Int!) {
           viewer {
-            starredRepositories(first: 100, after: $cursor) {
+            starredRepositories(first: $pageSize, after: $cursor) {
+              totalCount
               edges {
                 starredAt
                 node {
@@ -151,115 +178,117 @@ class GitHubAPIClient:
           }
         }
         """
+        variables: Dict[str, Any] = {"pageSize": page_size}
+        if cursor:
+            variables["cursor"] = cursor
 
-        repos = []
-        cursor = None
-        has_next_page = True
+        result = self._execute_graphql_query(query, variables)
+        data = self._extract_starred_repositories_payload(result)
+        edges = data.get("edges", [])
 
-        try:
-            while has_next_page:
-                variables = {"cursor": cursor} if cursor else {}
-                result = self.graphql_api.graphql.query(query, variables=variables)
+        repos = [self._build_starred_repo_from_graphql_edge(edge) for edge in edges]
+        page_info = data.get("pageInfo", {})
 
-                if not isinstance(result, dict):
-                    raise GangerError("GitHub GraphQL response was not a JSON object")
+        self.rate_limiter.track_request("bulk_graphql")
 
-                errors = result.get("errors", [])
-                if errors:
-                    error_messages = ", ".join(
-                        error.get("message", "Unknown GraphQL error") for error in errors
-                    )
-                    if any(
-                        error.get("type") == "RATE_LIMITED"
-                        or "rate limit" in error.get("message", "").lower()
-                        for error in errors
-                    ):
-                        raise RateLimitExceededError(error_messages)
-                    if any("bad credentials" in error.get("message", "").lower() for error in errors):
-                        raise AuthenticationError("GitHub authentication failed")
-                    raise GangerError(f"GitHub GraphQL error: {error_messages}")
+        return {
+            "repos": repos,
+            "total_count": data.get("totalCount"),
+            "has_next_page": page_info.get("hasNextPage", False),
+            "end_cursor": page_info.get("endCursor"),
+        }
 
-                if "viewer" not in result:
-                    logger.warning("GitHub GraphQL response missing 'viewer'; returning partial result")
-                    return repos
+    def _execute_graphql_query(self, query: str, variables: Dict[str, Any]) -> Any:
+        """Execute a GitHub GraphQL query.
 
-                data = result.get("viewer", {}).get("starredRepositories", {})
-                edges = data.get("edges", [])
+        ghapi doesn't expose a stable `.graphql.query(...)` surface across versions.
+        Prefer the explicit `/graphql` endpoint, but keep compatibility with tests
+        and any older wrapper that may still provide a `graphql.query` helper.
+        """
+        graphql_group = getattr(self.graphql_api, "graphql", None)
+        if graphql_group is not None and hasattr(graphql_group, "query"):
+            return graphql_group.query(query, variables=variables)
 
-                for edge in edges:
-                    node = edge["node"]
-                    starred_at_str = edge.get("starredAt")
+        return self.graphql_api(
+            "/graphql",
+            verb="POST",
+            data={"query": query, "variables": variables},
+        )
 
-                    # Extract topics
-                    topics = []
-                    topic_nodes = node.get("repositoryTopics", {}).get("nodes", [])
-                    for topic_node in topic_nodes:
-                        topic_name = topic_node.get("topic", {}).get("name")
-                        if topic_name:
-                            topics.append(topic_name)
+    def _extract_starred_repositories_payload(self, result: Any) -> Dict[str, Any]:
+        """Normalize a GraphQL response to the `starredRepositories` payload."""
+        if not hasattr(result, "get"):
+            raise GangerError("GitHub GraphQL response was not a JSON object")
 
-                    # Parse dates
-                    created_at = self._parse_datetime(node.get("createdAt"))
-                    updated_at = self._parse_datetime(node.get("updatedAt"))
-                    pushed_at = self._parse_datetime(node.get("pushedAt"))
-                    starred_at = self._parse_datetime(starred_at_str)
+        errors = result.get("errors", [])
+        if errors:
+            error_messages = ", ".join(
+                error.get("message", "Unknown GraphQL error") for error in errors
+            )
+            if any(
+                error.get("type") == "RATE_LIMITED"
+                or "rate limit" in error.get("message", "").lower()
+                for error in errors
+            ):
+                raise RateLimitExceededError(error_messages)
+            if any("bad credentials" in error.get("message", "").lower() for error in errors):
+                raise AuthenticationError("GitHub authentication failed")
+            raise GangerError(f"GitHub GraphQL error: {error_messages}")
 
-                    # Extract language
-                    language = None
-                    if node.get("primaryLanguage"):
-                        language = node["primaryLanguage"]["name"]
+        payload = result.get("data", result)
+        viewer = payload.get("viewer")
+        if viewer is None:
+            logger.warning("GitHub GraphQL response missing 'viewer'; treating as empty result")
+            return {}
 
-                    # Extract license
-                    license_name = None
-                    if node.get("licenseInfo"):
-                        license_name = node["licenseInfo"]["name"]
+        return viewer.get("starredRepositories", {})
 
-                    # Extract default branch
-                    default_branch = "main"
-                    if node.get("defaultBranchRef"):
-                        default_branch = node["defaultBranchRef"]["name"]
+    def _build_starred_repo_from_graphql_edge(self, edge: Dict[str, Any]) -> StarredRepo:
+        """Build a `StarredRepo` from a GraphQL edge."""
+        node = edge["node"]
+        topics = []
+        topic_nodes = node.get("repositoryTopics", {}).get("nodes", [])
+        for topic_node in topic_nodes:
+            topic_name = topic_node.get("topic", {}).get("name")
+            if topic_name:
+                topics.append(topic_name)
 
-                    repo = StarredRepo(
-                        id=node["id"],
-                        full_name=node["nameWithOwner"],
-                        name=node["name"],
-                        owner=node["owner"]["login"],
-                        description=node.get("description") or "",
-                        stars_count=node.get("stargazerCount", 0),
-                        forks_count=node.get("forkCount", 0),
-                        watchers_count=node.get("watchers", {}).get("totalCount", 0),
-                        language=language,
-                        topics=topics,
-                        is_archived=node.get("isArchived", False),
-                        is_private=node.get("isPrivate", False),
-                        is_fork=node.get("isFork", False),
-                        created_at=created_at,
-                        updated_at=updated_at,
-                        pushed_at=pushed_at,
-                        starred_at=starred_at,
-                        url=node.get("url", ""),
-                        clone_url=node.get("sshUrl", ""),
-                        homepage=node.get("homepageUrl"),
-                        default_branch=default_branch,
-                        license=license_name,
-                    )
-                    repos.append(repo)
+        language = None
+        if node.get("primaryLanguage"):
+            language = node["primaryLanguage"]["name"]
 
-                # Pagination
-                page_info = data.get("pageInfo", {})
-                has_next_page = page_info.get("hasNextPage", False)
-                cursor = page_info.get("endCursor")
+        license_name = None
+        if node.get("licenseInfo"):
+            license_name = node["licenseInfo"]["name"]
 
-                self.rate_limiter.track_request("bulk_graphql")
+        default_branch = "main"
+        if node.get("defaultBranchRef"):
+            default_branch = node["defaultBranchRef"]["name"]
 
-            return repos
-
-        except (AuthenticationError, GangerError, RateLimitExceededError):
-            raise
-        except Exception as e:
-            # Fallback to REST if GraphQL fails
-            logger.warning("GraphQL query failed, falling back to REST API: %s", e)
-            return self._get_starred_rest()
+        return StarredRepo(
+            id=node["id"],
+            full_name=node["nameWithOwner"],
+            name=node["name"],
+            owner=node["owner"]["login"],
+            description=node.get("description") or "",
+            stars_count=node.get("stargazerCount", 0),
+            forks_count=node.get("forkCount", 0),
+            watchers_count=node.get("watchers", {}).get("totalCount", 0),
+            language=language,
+            topics=topics,
+            is_archived=node.get("isArchived", False),
+            is_private=node.get("isPrivate", False),
+            is_fork=node.get("isFork", False),
+            created_at=self._parse_datetime(node.get("createdAt")),
+            updated_at=self._parse_datetime(node.get("updatedAt")),
+            pushed_at=self._parse_datetime(node.get("pushedAt")),
+            starred_at=self._parse_datetime(edge.get("starredAt")),
+            url=node.get("url", ""),
+            clone_url=node.get("sshUrl", ""),
+            homepage=node.get("homepageUrl"),
+            default_branch=default_branch,
+            license=license_name,
+        )
 
     def get_repo(self, full_name: str) -> StarredRepo:
         """
