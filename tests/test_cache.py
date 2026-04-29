@@ -6,6 +6,7 @@ Modified: 2025-11-07
 
 import pytest
 import pytest_asyncio
+import aiosqlite
 from pathlib import Path
 from datetime import datetime, timezone
 from ganger.core.cache import PersistentCache
@@ -139,6 +140,30 @@ class TestStarredReposOperations:
 
         repos = await cache.get_starred_repos()
         assert repos is None
+
+    @pytest.mark.asyncio
+    async def test_get_starred_repos_uses_sync_timestamp_for_freshness(self, cache, sample_repos):
+        """Partial syncs should stay fresh based on the latest sync activity, not the oldest row."""
+        await cache.upsert_starred_repos(sample_repos)
+
+        old_timestamp = "2000-01-01T00:00:00"
+        async with aiosqlite.connect(cache.db_path) as db:
+            await db.execute(
+                "UPDATE starred_repos SET cached_at = ?, accessed_at = ? WHERE id = ?",
+                (old_timestamp, old_timestamp, sample_repos[0].id),
+            )
+            await db.commit()
+
+        await cache.set_starred_sync_state(
+            cached_count=len(sample_repos),
+            total_count=10,
+            cursor="cursor-2",
+            complete=False,
+        )
+
+        repos = await cache.get_starred_repos()
+        assert repos is not None
+        assert len(repos) == len(sample_repos)
 
     @pytest.mark.asyncio
     async def test_set_starred_repos_preserves_existing_folder_links(

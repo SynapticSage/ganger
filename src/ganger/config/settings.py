@@ -53,7 +53,9 @@ class CacheSettings:
     """Cache settings."""
 
     db_path: str = "~/.cache/ganger/ganger.db"
-    repos_ttl: int = 3600  # 1 hour
+    # Stars rarely change (a user maybe stars 1-5 repos a week). A 24h TTL keeps
+    # the cache hot across a full workday without forcing API round-trips.
+    repos_ttl: int = 86400  # 24 hours
     metadata_ttl: int = 86400  # 24 hours
     readme_ttl: int = 604800  # 7 days
     load_on_startup: bool = False  # Whether to load starred repos on startup

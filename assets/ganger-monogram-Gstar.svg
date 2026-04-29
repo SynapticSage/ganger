@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="640" viewBox="0 0 640 640">
+  <rect x="0" y="0" width="640" height="640" fill="#0b1220"/>
+  <!-- G ring -->
+  <circle cx="320" cy="320" r="220" fill="none" stroke="#0f172a" stroke-width="40"/>
+  <path d="M 320 100 A 220 220 0 1 1 320 540" fill="none" stroke="#e5e7eb" stroke-width="44" stroke-linecap="round"/>
+  <line x1="320" y1="320" x2="500" y2="320" stroke="#e5e7eb" stroke-width="44" stroke-linecap="round"/>
+  <!-- star -->
+  <path d="M470.00,204.00 L482.93,232.20 L513.75,235.79 L490.92,256.80 L497.04,287.21 L470.00,272.00 L442.96,287.21 L449.08,256.80 L426.25,235.79 L457.07,232.20 Z" fill="#ffd34d"/>
+</svg>

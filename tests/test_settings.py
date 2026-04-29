@@ -28,7 +28,7 @@ class TestSettings:
 
         assert settings.github.auth_method == "auto"
         assert settings.github.cache_enabled is True
-        assert settings.cache.repos_ttl == 3600
+        assert settings.cache.repos_ttl == 86400
         assert len(settings.folders.default_folders) >= 5
         assert settings.behavior.confirm_unstar is True
         assert settings.mcp.name == "ganger"
@@ -67,7 +67,7 @@ class TestSettings:
         settings = Settings.load(Path("/nonexistent/config.yaml"))
 
         assert settings.github.auth_method == "auto"
-        assert settings.cache.repos_ttl == 3600
+        assert settings.cache.repos_ttl == 86400
         assert any(folder["name"] == "Python Projects" for folder in settings.folders.default_folders)
 
     def test_environment_variable_override(self, monkeypatch, tmp_path):
@@ -101,7 +101,7 @@ class TestSettings:
         assert "mcp" in settings_dict
 
         assert settings_dict["github"]["auth_method"] == "auto"
-        assert settings_dict["cache"]["repos_ttl"] == 3600
+        assert settings_dict["cache"]["repos_ttl"] == 86400
 
     def test_get_config_dir(self):
         """Test getting config directory."""

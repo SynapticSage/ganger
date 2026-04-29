@@ -112,7 +112,7 @@ class TestMainEntryPoint:
 
         # Verify create_server was called with defaults
         expected_cache_path = Path("~/.cache/ganger/ganger.db").expanduser()
-        mock_create_server.assert_called_once_with(cache_path=expected_cache_path, cache_ttl=3600)
+        mock_create_server.assert_called_once_with(cache_path=expected_cache_path, cache_ttl=86400)
         mock_server.run.assert_called_once()
 
     @patch("ganger.mcp.server.Settings.load")

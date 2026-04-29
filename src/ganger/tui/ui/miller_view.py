@@ -15,6 +15,7 @@ from textual.widgets import Static, LoadingIndicator
 from textual.reactive import reactive
 from textual.widget import Widget
 from textual import events
+from rich.text import Text
 
 from ...core.models import VirtualFolder, StarredRepo
 from ..messages import FolderSelected, RepoSelected, RangerCommand, SelectionChanged
@@ -67,6 +68,7 @@ class FolderColumn(ScrollableContainer):
         self.can_focus = True
         self.search_query = ""
         self.search_matches: List[int] = []
+        self._suspend_selection_events = False
 
     def compose(self) -> ComposeResult:
         """Initial composition."""
@@ -75,11 +77,15 @@ class FolderColumn(ScrollableContainer):
     async def set_folders(self, folders: List[VirtualFolder]) -> None:
         """Set the folders to display."""
         self.folders = folders
-        if self.folders:
-            self.selected_index = min(self.selected_index, len(self.folders) - 1)
-        else:
-            self.selected_index = 0
-        await self.refresh_display()
+        new_index = min(self.selected_index, len(self.folders) - 1) if self.folders else 0
+
+        self._suspend_selection_events = True
+        try:
+            if new_index != self.selected_index:
+                self.selected_index = new_index
+            await self.refresh_display()
+        finally:
+            self._suspend_selection_events = False
 
     async def refresh_display(self) -> None:
         """Refresh the folder display."""
@@ -90,7 +96,10 @@ class FolderColumn(ScrollableContainer):
             await self.mount(Static("No folders", classes="loading"))
             return
 
-        # Add folder items
+        # Build all items first, then mount in a single batch. Sequential
+        # `await self.mount(item)` triggers one Textual layout pass per item,
+        # which is O(n) async hops; mount_all is one pass.
+        items: List[Widget] = []
         for i, folder in enumerate(self.folders):
             classes = ["folder-item"]
             if i == self.selected_index:
@@ -100,13 +109,18 @@ class FolderColumn(ScrollableContainer):
 
             item = Static(
                 f"📁 {folder.name} ({folder.repo_count})",
-                classes=" ".join(classes)
+                classes=" ".join(classes),
+                markup=False,
             )
             item.folder = folder  # Attach folder data
-            await self.mount(item)
+            items.append(item)
+        await self.mount_all(items)
 
     def watch_selected_index(self, old_value: int, new_value: int) -> None:
         """React to selection changes."""
+        if self._suspend_selection_events:
+            return
+
         # Update visual selection
         items = self.query(".folder-item")
         for i, item in enumerate(items):
@@ -214,6 +228,7 @@ class RepoColumn(ScrollableContainer):
         self.visual_start_index: Optional[int] = None
         self.search_query = ""
         self.search_matches: List[int] = []
+        self._suspend_selection_events = False
 
     def compose(self) -> ComposeResult:
         """Initial composition."""
@@ -224,11 +239,16 @@ class RepoColumn(ScrollableContainer):
         self.repos = repos
         visible_repo_ids = {repo.id for repo in repos}
         self.marked_repos &= visible_repo_ids
-        if self.repos:
-            self.selected_index = min(self.selected_index, len(self.repos) - 1)
-        else:
-            self.selected_index = 0
-        await self.refresh_display()
+        new_index = min(self.selected_index, len(self.repos) - 1) if self.repos else 0
+
+        self._suspend_selection_events = True
+        try:
+            if new_index != self.selected_index:
+                self.selected_index = new_index
+            await self.refresh_display()
+        finally:
+            self._suspend_selection_events = False
+
         self.post_message(SelectionChanged(len(self.marked_repos)))
         if self.repos and 0 <= self.selected_index < len(self.repos):
             self.post_message(RepoSelected(self.repos[self.selected_index]))
@@ -242,7 +262,10 @@ class RepoColumn(ScrollableContainer):
             await self.mount(Static("No repos in this folder", classes="loading"))
             return
 
-        # Add repo items
+        # Build all items first, then mount in a single batch. Per-item
+        # `await self.mount(...)` is O(n) async hops; for "All Stars" with
+        # hundreds-to-thousands of repos this dominates folder-switch latency.
+        items: List[Widget] = []
         for i, repo in enumerate(self.repos):
             classes = ["repo-item"]
             if i == self.selected_index:
@@ -252,24 +275,29 @@ class RepoColumn(ScrollableContainer):
             if i in self.search_matches:
                 classes.append("search-match")
 
-            # Format repo display
             mark = "✓" if repo.id in self.marked_repos else " "
             stars = f"⭐ {repo.stars_count:,}" if repo.stars_count else ""
             language = f"[{repo.language}]" if repo.language else ""
 
-            # Line 1: Mark + Name + Stars
             line1 = f"{mark} {repo.name} {stars}"
-            # Line 2: Owner + Language
             line2 = f"  @{repo.owner} {language}"
 
-            content = f"{line1}\n{line2}"
-
-            item = Static(content, classes=" ".join(classes))
-            item.repo = repo  # Attach repo data
-            await self.mount(item)
+            # Repo names/owners/languages can contain `[` which Static would
+            # otherwise treat as Rich markup; disable markup parsing.
+            item = Static(
+                f"{line1}\n{line2}",
+                classes=" ".join(classes),
+                markup=False,
+            )
+            item.repo = repo
+            items.append(item)
+        await self.mount_all(items)
 
     def watch_selected_index(self, old_value: int, new_value: int) -> None:
         """React to selection changes."""
+        if self._suspend_selection_events:
+            return
+
         # Update visual selection
         items = self.query(".repo-item")
         for i, item in enumerate(items):
@@ -388,51 +416,58 @@ class PreviewPane(ScrollableContainer):
         # Clear existing content
         await self.remove_children()
 
-        # Build preview content
-        lines = []
+        content = Text()
 
         # Header
-        lines.append(f"[bold]{repo.name}[/bold]")
-        lines.append(f"@{repo.owner}/{repo.name}")
-        lines.append("")
+        content.append(repo.name, style="bold")
+        content.append("\n")
+        content.append(f"@{repo.owner}/{repo.name}")
+        content.append("\n\n")
 
         # Metadata
-        stars = f"⭐ {repo.stars_count:,}" if repo.stars_count else ""
-        forks = f"🍴 {repo.forks_count:,}" if repo.forks_count else ""
-        language = f"📝 {repo.language}" if repo.language else ""
-        lines.append(f"{stars}  {forks}  {language}")
-        lines.append("")
+        meta_parts = []
+        if repo.stars_count:
+            meta_parts.append(f"⭐ {repo.stars_count:,}")
+        if repo.forks_count:
+            meta_parts.append(f"🍴 {repo.forks_count:,}")
+        if repo.language:
+            meta_parts.append(f"📝 {repo.language}")
+        if meta_parts:
+            content.append("  ".join(meta_parts))
+            content.append("\n\n")
 
         # Description
         if repo.description:
-            lines.append("[bold]Description[/bold]")
-            lines.append(repo.description)
-            lines.append("")
+            content.append("Description", style="bold")
+            content.append("\n")
+            content.append(repo.description)
+            content.append("\n\n")
 
         # Topics
         if repo.topics:
-            lines.append("[bold]Topics[/bold]")
-            topics_str = ", ".join(f"#{topic}" for topic in repo.topics[:5])
-            lines.append(topics_str)
-            lines.append("")
+            content.append("Topics", style="bold")
+            content.append("\n")
+            content.append(", ".join(f"#{topic}" for topic in repo.topics[:5]))
+            content.append("\n\n")
 
         # Dates
-        lines.append("[bold]Info[/bold]")
+        content.append("Info", style="bold")
+        content.append("\n")
         if repo.created_at:
-            lines.append(f"Created: {repo.created_at.strftime('%Y-%m-%d')}")
+            content.append(f"Created: {repo.created_at.strftime('%Y-%m-%d')}\n")
         if repo.updated_at:
-            lines.append(f"Updated: {repo.updated_at.strftime('%Y-%m-%d')}")
+            content.append(f"Updated: {repo.updated_at.strftime('%Y-%m-%d')}\n")
         if repo.starred_at:
-            lines.append(f"Starred: {repo.starred_at.strftime('%Y-%m-%d')}")
-        lines.append("")
+            content.append(f"Starred: {repo.starred_at.strftime('%Y-%m-%d')}\n")
+        content.append("\n")
 
         # URL
-        lines.append(f"[link={repo.url}]{repo.url}[/link]")
+        if repo.url:
+            content.append(repo.url, style=f"link {repo.url}")
 
         # TODO: Fetch and display README
 
-        content = "\n".join(lines)
-        await self.mount(Static(content, markup=True))
+        await self.mount(Static(content))
 
 
 class MillerView(Widget):

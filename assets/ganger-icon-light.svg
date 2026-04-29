@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <filter id="shadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#d1d5db" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+  <rect rx="32" ry="32" x="16" y="16" width="480" height="480" fill="#ffffff" stroke="#d1d5db" stroke-width="2"/>
+  <rect rx="24" ry="24" x="48" y="64" width="416" height="384" fill="#edf2f7" stroke="#d1d5db" stroke-width="1.5"/>
+  <!-- top bar -->
+  <rect rx="24" ry="24" x="48" y="64" width="416" height="44" fill="none" stroke="#d1d5db" stroke-width="1"/>
+  <circle cx="76" cy="86" r="6" fill="#ef4444"/>
+  <circle cx="100" cy="86" r="6" fill="#f59e0b"/>
+  <circle cx="124" cy="86" r="6" fill="#22c55e"/>
+  <!-- Miller columns -->
+  <line x1="192" y1="108" x2="192" y2="448" stroke="#d1d5db" stroke-width="1.5"/>
+  <line x1="336" y1="108" x2="336" y2="448" stroke="#d1d5db" stroke-width="1.5"/>
+  <!-- folder list bullets -->
+  <g stroke="#4b5563" stroke-width="10" stroke-linecap="round">
+    <line x1="88" y1="148" x2="152" y2="148"/>
+    <line x1="88" y1="184" x2="152" y2="184"/>
+    <line x1="88" y1="220" x2="152" y2="220"/>
+    <line x1="88" y1="256" x2="152" y2="256"/>
+  </g>
+  <!-- starred repos lines -->
+  <g stroke="#111827" stroke-width="8" stroke-linecap="round">
+    <line x1="216" y1="156" x2="312" y2="156"/>
+    <line x1="216" y1="196" x2="312" y2="196"/>
+    <line x1="216" y1="236" x2="312" y2="236"/>
+    <line x1="216" y1="276" x2="312" y2="276"/>
+  </g>
+  <!-- preview pane lines -->
+  <g stroke="#4b5563" stroke-width="6" stroke-linecap="round">
+    <line x1="360" y1="156" x2="424" y2="156"/>
+    <line x1="360" y1="184" x2="440" y2="184"/>
+    <line x1="360" y1="212" x2="440" y2="212"/>
+    <line x1="360" y1="240" x2="424" y2="240"/>
+  </g>
+  <!-- star -->
+  <path d="M256.00,202.00 L268.93,232.20 L301.65,235.17 L276.92,256.80 L284.21,288.83 L256.00,272.00 L227.79,288.83 L235.08,256.80 L210.35,235.17 L243.07,232.20 Z" fill="#be7c00" filter="url(#shadow)"/>
+  <!-- cursor caret -->
+  <path d="M 216 316 L 216 346" stroke="#0ea5e9" stroke-width="6" stroke-linecap="round"/>
+  <!-- subtle G arc -->
+  <path d="M 136 372 A 136 136 0 0 0 400 372" fill="none" stroke="#7c3aed" stroke-opacity="0.35" stroke-width="10" stroke-linecap="round"/>
+</svg>

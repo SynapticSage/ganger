@@ -177,6 +177,52 @@ class TestLoadStarredRepos:
         assert repo_sync_callback.await_args_list[0].args == (2, len(sample_repos))
         assert repo_sync_callback.await_args_list[1].args == (len(sample_repos), len(sample_repos))
 
+    @pytest.mark.asyncio
+    async def test_incremental_graphql_sync_resumes_from_cached_cursor(
+        self, temp_cache, mock_settings, sample_repos
+    ):
+        """A restarted sync should continue from the saved cursor instead of starting over."""
+
+        class ResumeAPI:
+            def __init__(self, repos):
+                self.repos = repos
+                self.calls = []
+
+            def get_starred_repos_page(self, cursor=None):
+                self.calls.append(cursor)
+                assert cursor == "page-2"
+                return {
+                    "repos": self.repos[2:],
+                    "total_count": len(self.repos),
+                    "has_next_page": False,
+                    "end_cursor": None,
+                }
+
+        await temp_cache.upsert_starred_repos(sample_repos[:2])
+        await temp_cache.set_starred_sync_state(
+            cached_count=2,
+            total_count=len(sample_repos),
+            cursor="page-2",
+            complete=False,
+        )
+
+        api = ResumeAPI(sample_repos)
+        folder_manager = AsyncMock()
+        repo_sync_callback = AsyncMock()
+        loader = DataLoader(
+            api,
+            temp_cache,
+            folder_manager,
+            mock_settings,
+            repo_sync_callback=repo_sync_callback,
+        )
+
+        repos = await loader.load_starred_repos(force_refresh=False)
+
+        assert api.calls == ["page-2"]
+        assert len(repos) == len(sample_repos)
+        assert repo_sync_callback.await_args_list[0].args == (2, len(sample_repos))
+
 
 @pytest.mark.integration
 class TestDefaultFolders:

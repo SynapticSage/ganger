@@ -1,0 +1,340 @@
+================================================================================
+GANGER — Investigation: error-message.txt cascade
+Date investigated: 2026-04-26
+File: /Users/ryoung/Code/repos/NewCliProjects/ganger/error-message.txt
+Size:  3.9 MB / 16,798 lines / ~10 duplicated traceback panels
+================================================================================
+
+TL;DR
+-----
+The error file is a *cascade*, not a single failure. It contains exactly one
+underlying bug repeatedly re-rendered. The bug splits into two layers:
+
+  Layer A — VISIBLE in the file:
+    Pygments PythonLexer regex compilation hits Python's recursion limit
+    while Textual's _fatal_error renderer is highlighting traceback source.
+    Once that renderer fails, Textual catches the new error and tries to
+    render IT, hitting the same wall. Repeat ~10x → 3.9 MB of duplicates.
+
+  Layer B — HIDDEN by the cascade:
+    The ORIGINAL exception that started the cascade was raised inside an
+    AwaitMount callback dispatched on RepoColumn(id='repo-column'). Its
+    text and frames are NOT in the file because Textual's renderer ate
+    them while attempting to display Layer A.
+
+The cascade is the noise. The hidden Layer B trigger is the actual bug. Layer
+A is well-understood; Layer B requires one more reproduction run with the
+renderer bypassed (instructions at the bottom of this report).
+
+
+================================================================================
+1. ANATOMY OF THE CASCADE (Layer A — fully understood)
+================================================================================
+
+Each duplicate panel in error-message.txt follows the same call chain:
+
+  textual/message_pump.py:591   _flush_next_callbacks
+    └─ Callback(callback=functools.partial(<AwaitMount object>))   ← Layer B
+       was here, then raised something
+       └─ caught by `except Exception as error:` at line 590
+          └─ calls self.app._handle_exception(error)
+             └─ textual/app.py:2163 _handle_exception
+                └─ textual/app.py:2174 _fatal_error
+                   builds rich.traceback.Traceback(show_locals=True, …)
+                   └─ Segments(self.console.render(traceback, …))
+                      └─ rich/panel.py:224  → rich/padding.py:97
+                         → rich/table.py:509/822 → rich/syntax.py:621
+                         → rich/syntax.py:480  highlight()
+                         → rich/syntax.py:433  lexer
+                         → pygments/lexers/__init__.py:127 get_lexer_by_name
+                         └─ pygments/lexer.py:660 PythonLexer.__call__
+                            └─ pygments/lexer.py:599 process_tokendef
+                               └─ pygments/lexer.py:579 _process_state
+                                  └─ pygments/regexopt.py:77 regex_opt_inner
+                                     ████ HITS sys.recursionlimit ████
+
+  → RecursionError in regex_opt_inner
+  → wrapped at lexer.py:581 as:
+       ValueError: uncompilable regex <pygments.lexer.words …> in state
+       'builtins' of <class 'pygments.lexers.python.PythonLexer'>: maximum
+       recursion depth exceeded …
+  → That ValueError escapes _fatal_error, returns to message_pump.py:591
+  → message_pump catches it again, calls _handle_exception again
+  → cycle repeats
+
+Why the recursion: PythonLexer's first-time compilation uses
+regex_opt_inner to build a giant alternation regex of ~75 Python builtins
+(`pow`, `print`, `property`, `range`, …) by recursively grouping common
+prefixes. Each recursion strips one character. With Python 3.10's default
+recursion limit of 1000, that compile alone needs ~280–320 frames.
+
+The RENDER PATH from Textual's _fatal_error down to the Pygments compile
+adds another ~30 frames (Panel → Padding → Table → Padding → Syntax → …).
+
+The AwaitMount callback path in the async event loop already had ~600
+frames on the stack BEFORE Layer B raised. Pygments was the straw that
+broke 1000.
+
+VERIFIED LOCALLY:
+  $ python3.10 -c "import textual, pygments, sys
+  print(textual.__version__, pygments.__version__, sys.getrecursionlimit())"
+  → textual=0.47.1, pygments=2.19.2, recursionlimit=1000
+
+  At recursionlimit=500 (still well below the budget consumed at runtime),
+  cold-compiling PythonLexer + rendering Syntax succeeds in isolation.
+  Therefore the limit is not too low intrinsically — it is exhausted by
+  the deep async/widget call stack already in flight.
+
+The duplicated tracebacks differ in which specific frame inside Pygments
+finally tips over (`<genexpr>`, `regex_opt_inner`, `commonprefix`,
+`__instancecheck__`) — that confirms it is depth-pressure, not a
+deterministic Pygments bug.
+
+
+================================================================================
+2. THE HIDDEN TRIGGER (Layer B — must be re-reproduced to see)
+================================================================================
+
+What the cascade tells us:
+
+  • The originating exception was raised inside
+        textual.message_pump.MessagePump._flush_next_callbacks
+    while dispatching:
+        Callback(callback=functools.partial(<textual.widget.AwaitMount>))
+    on:
+        self = RepoColumn(id='repo-column')
+
+  • AwaitMount is the awaitable returned by Widget.mount(). The callback
+    being dispatched here is therefore a post-mount continuation for one of
+    the children RepoColumn just mounted via:
+        await self.mount(item)
+    in src/ganger/tui/ui/miller_view.py:284 (inside refresh_display).
+
+  • So the original exception almost certainly came from:
+      - rendering one of the Static children mounted into RepoColumn, OR
+      - a downstream message-handler that fired post-mount on RepoColumn.
+
+The originating exception text is NOT preserved in error-message.txt — it
+was discarded the moment Textual's renderer for it failed.
+
+
+================================================================================
+3. SUSPECTS, RANKED (informed by the uncommitted diff)
+================================================================================
+
+Modified files in the working tree (relevant to RepoColumn's mount path):
+
+  src/ganger/core/cache.py            (+~110 lines: sync-state metadata)
+  src/ganger/core/data_loader.py      (+~ 60 lines: resumable incremental sync)
+  src/ganger/tui/ui/miller_view.py    (+~ 95 lines: _suspend_selection_events,
+                                         PreviewPane Markup→Text conversion)
+  src/ganger/tui/app.py               (-2 lines:  removed two
+                                         post_message(FolderSelected) calls)
+
+Plus the new uncommitted test:
+  tests/test_tui_app.py
+    test_preview_pane_handles_repo_text_without_markup_crashing
+  → "Preview rendering should tolerate repo text that looks like Rich markup."
+
+The TEST NAME is a smoking gun: the developer recently encountered a
+"Rich markup crash" in the preview pane caused by repo strings that
+contained square brackets, and converted PreviewPane.show_repo from
+"[bold]…[/bold]" markup strings to rich.text.Text objects (markup-safe).
+
+That fix lands in PreviewPane only. **The same class of bug remains
+unaddressed in RepoColumn.** Specifically, in miller_view.py:267–283:
+
+      mark = "✓" if repo.id in self.marked_repos else " "
+      stars = f"⭐ {repo.stars_count:,}" if repo.stars_count else ""
+      language = f"[{repo.language}]" if repo.language else ""   ← brackets
+      line1 = f"{mark} {repo.name} {stars}"
+      line2 = f"  @{repo.owner} {language}"                       ← brackets
+      content = f"{line1}\n{line2}"
+      item = Static(content, classes=" ".join(classes))           ← markup=True
+
+`Static.__init__` defaults `markup=True`. The string is fed through
+`Text.from_markup`, which interprets `[Python]`, `[JavaScript]`, `[C++]`,
+or any `[bracketed]` substring inside `repo.name` as a markup tag.
+
+EMPIRICAL CHECK (this machine, rich==13.7.1):
+  Text.from_markup("  @octocat [Python]")     → no exception (lenient)
+  Text.from_markup("  @octocat [C++]")        → no exception (lenient)
+  Text.from_markup("Repo with [broken markup] and stray [brackets")
+                                              → no exception, BUT the content
+                                                "[broken markup]" is silently
+                                                stripped from the displayed text.
+
+So on this exact rich version, bracketed languages don't *raise*. But:
+  • Rich's strict_markup mode, or older/newer Rich, can raise.
+  • If `[non-style-name]` is followed in the same string by `[/]` or by
+    whitespace patterns the parser treats as style continuations, it does
+    raise MarkupError.
+  • This bug matches the developer's prior fix in PreviewPane exactly,
+    which strongly suggests it was the trigger they investigated. It may
+    no longer raise on the Rich version installed at trace time, but if
+    the user has any repo whose name/owner/description contains a tag
+    Rich does interpret strictly (e.g. `[red]`, `[bold]`, `[link …]`),
+    `Static(...)` will fail.
+
+RANKED SUSPECTS for the hidden RepoColumn trigger:
+
+  S1  Rich-markup error from Static(content) where content contains
+      brackets matching Rich style names. Most consistent with the diff
+      and the new "without_markup_crashing" test. The fix in PreviewPane
+      was applied; the same fix was NOT applied to RepoColumn.
+      LIKELIHOOD: HIGH.
+
+  S2  Data-shape mismatch from the rebuilt cache path. The new
+      data_loader.py reads sync_state and switches between resume and
+      full-fetch. cache.py's get_starred_repos now uses a different
+      freshness marker (STARRED_SYNC_UPDATED_AT_KEY in metadata table)
+      and falls back to MAX(cached_at). If migration left an old DB in
+      a state where the new metadata key is missing AND the fallback
+      query yields a row whose `newest` is something stale, repos may
+      come back partially populated, with surprising types (e.g.
+      stars_count as None or as a str). Then RepoColumn's
+      f"⭐ {repo.stars_count:,}" can raise:
+          ValueError: Unknown format code ',' for object of type 'str'
+      or similar in __format__ during Static render.
+      Note: the user has cache.db files at:
+          ~/.config/ganger/cache.db        (last modified 2025-12-29)
+          ~/.config/ganger-dev/cache.db    (last modified 2025-11-08)
+      Both predate the cache.py changes, so a v1→v2 migration runs every
+      startup against the new code paths.
+      LIKELIHOOD: MEDIUM. Worth checking after S1.
+
+  S3  Selection-event suppression race. set_repos now sets
+      _suspend_selection_events=True around refresh_display, then unsets
+      it and posts RepoSelected explicitly. If `selected_index` is
+      mutated while the watch is suppressed but a post_message arrives
+      between the toggle-off and the explicit post, ordering of message
+      delivery can produce an out-of-bounds access in PreviewPane. This
+      would surface in PreviewPane, not RepoColumn, so it does not match
+      the trace's `self = RepoColumn`.
+      LIKELIHOOD: LOW.
+
+  S4  app.py removed two `post_message(FolderSelected(...))` calls in
+      _select_folder and action_delete_folder. Combined with the new
+      _suspend_selection_events guard, on cold start with
+      selected_index already 0, no FolderSelected ever fires →
+      RepoColumn never receives repos → user-visible "stuck on Loading"
+      but NOT a crash. Doesn't match the trace.
+      LIKELIHOOD: NEGLIGIBLE for this crash, but a real UX regression
+      worth fixing alongside.
+
+
+================================================================================
+4. RECOMMENDED ACTIONS, IN ORDER
+================================================================================
+
+Step 1 — UNMASK the original error.
+
+  Add this at the very top of test_tui.py (before the imports), or at
+  the top of src/ganger/tui/app.py before `class GangerApp`:
+
+      import sys
+      sys.setrecursionlimit(3000)
+
+  Rationale: this gives Pygments enough headroom to compile PythonLexer
+  even with the deep async/render stack on top of it. The cascade will
+  no longer trigger. The ORIGINAL Layer B exception will surface in its
+  full text, with ganger frames intact. This does not fix the bug — it
+  just makes the bug visible.
+
+Step 2 — Run the TUI again:
+
+      python test_tui.py 2> raw-err.txt
+
+  The first traceback in raw-err.txt will identify the real exception
+  type (most likely MarkupError from rich, or a ValueError/TypeError
+  from RepoColumn formatting). It should also point to the specific
+  repo that triggered it.
+
+Step 3 — Apply the same fix the developer applied to PreviewPane,
+         to RepoColumn:
+
+  In src/ganger/tui/ui/miller_view.py, RepoColumn.refresh_display
+  (around line 282), either:
+    (a) Pass markup=False to disable Rich markup parsing:
+            item = Static(content, classes=" ".join(classes),
+                          markup=False)
+    (b) Or build content as a rich.text.Text (matching the PreviewPane
+        approach), which is markup-safe by construction.
+
+  Apply the same to FolderColumn.refresh_display (line 107) for the
+  same reason — folder names can in principle contain brackets,
+  particularly user-created folders via the gn command.
+
+Step 4 — If S2 turns out to be the culprit instead of S1, audit
+  StarredRepo.from_dict() in src/ganger/core/models.py to ensure
+  it coerces stars_count/forks_count to int and topics to list, so
+  formatter calls in RepoColumn cannot fail on partially-populated rows.
+
+Step 5 — Tidy the file system. error-message.txt is 3.9 MB of
+  duplicated cascade and contains no information that will not be
+  reproducible after Step 1. Once Layer B is identified and fixed,
+  delete it (CLAUDE.md project policy: clean up after yourself). Per
+  the same policy, the experimental test_tui.py at repo root and the
+  PHASE1_COMPLETE.md / PHASE_2B_COMPLETE.md / TUI_TESTING.md notes
+  could be folded into git commits or removed.
+
+
+================================================================================
+5. WHAT WE KNOW, WHAT WE INFER, WHAT IS UNVERIFIED
+================================================================================
+
+KNOWN (from the file alone):
+  • The cascade mechanism is exactly Textual _fatal_error → Rich Traceback
+    → Syntax → Pygments PythonLexer compilation → recursion limit.
+  • The widget hosting the originating exception is RepoColumn(id=
+    'repo-column'), and the failing dispatch is a post-mount AwaitMount
+    callback (i.e. something inside RepoColumn.refresh_display's
+    `await self.mount(item)` loop).
+  • GangerApp is running in dark mode with a stylesheet successfully
+    loaded (`classes={'-dark-mode'}`).
+
+INFERRED (high confidence) from the diff and the new test:
+  • The developer recently fixed a Rich-markup crash in PreviewPane via
+    the Markup→Text conversion at miller_view.py:406–460. The new test
+    test_preview_pane_handles_repo_text_without_markup_crashing
+    explicitly proves this. The same class of bug exists in
+    RepoColumn.refresh_display and was NOT fixed.
+
+UNVERIFIED — REQUIRES STEP 1 ABOVE TO CONFIRM:
+  • The exact Python exception type and message of the originating
+    error.
+  • Whether the bug is markup-related (S1) or data-shape-related (S2).
+  • Which specific repo / row data triggered it.
+
+
+================================================================================
+6. PEDAGOGY (why this is worth understanding once)
+================================================================================
+
+  • Rendering an exception is itself code that can fail. When that
+    rendering relies on heavy machinery (syntax highlighting, locals
+    introspection, table layout), it brings recursion and import
+    cost into the error path. If the framework's error handler does
+    not have a non-rendering fallback, the failure mode is a
+    self-amplifying log explosion exactly like this one.
+
+  • Textual's _fatal_error is a single-shot renderer with no
+    de-duplication and no plain-text fallback. Setting a higher
+    recursion limit at app startup is a cheap defense-in-depth even
+    when no bug is suspected, because it prevents any future
+    Pygments compile from being the visible failure mode of an
+    unrelated bug.
+
+  • show_locals=True is wonderful for debugging your own code, but
+    when the local in question is a Pygments tokendef table or a
+    SQLAlchemy session, the locals dump can multiply file size by
+    100×. The 3.9 MB here is mostly tokendef tables.
+
+  • In a Textual widget tree, "the failing widget" reported in the
+    trace is the widget *whose callback queue dispatched the failing
+    callback* — not necessarily the widget whose code raised. Mount
+    is dispatched up the parent chain. So `self = RepoColumn` here
+    means the error originated in something RepoColumn was mounting
+    or in a post-mount handler keyed to RepoColumn — typically a
+    Static child's __rich_console__.
+================================================================================

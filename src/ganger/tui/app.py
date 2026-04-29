@@ -6,10 +6,19 @@ Modified: 2025-11-08
 """
 
 import asyncio
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Dict, Optional, List
 import logging
+
+# Textual's _fatal_error renders unhandled exceptions via rich.traceback →
+# rich.syntax → Pygments PythonLexer. The lexer's first-time compile recurses
+# ~300 frames deep; on top of an already-deep async/widget stack the default
+# recursionlimit=1000 can be exhausted, replacing the real exception with a
+# Pygments "uncompilable regex" cascade. Raise the ceiling so the original
+# error is what surfaces.
+sys.setrecursionlimit(3000)
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -108,6 +117,11 @@ class GangerApp(App):
         self.current_repo: Optional[StarredRepo] = None
         self.folders_loaded: bool = False
 
+        # In-memory folder_id -> repos cache. Skips the SQLite round-trip on
+        # repeat folder selection (j/k navigation hits the same folder often).
+        # Invalidated whenever load_folders() runs or folder contents mutate.
+        self._folder_repos_cache: Dict[str, List[StarredRepo]] = {}
+
         # Settings
         self.settings = Settings.load(self.config_dir / "config.yaml")
 
@@ -189,6 +203,32 @@ class GangerApp(App):
         )
         await loader.ensure_default_folders()
 
+    def _handle_exception(self, error: Exception) -> None:
+        """Bypass Textual's Rich/Pygments-based traceback renderer.
+
+        The default `_fatal_error` builds a `rich.traceback.Traceback`, which
+        forces a cold compile of Pygments' PythonLexer. Pygments does not
+        cache *failed* compilations — every retry starts over, sitting on a
+        deeper stack than the last. The result is a self-amplifying cascade
+        that buries the original exception under megabytes of "uncompilable
+        regex" noise. Write the real traceback to stderr and the log, then
+        exit. No rendering, no cascade.
+        """
+        import traceback
+
+        formatted = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
+        logger.error("Unhandled exception in TUI:\n%s", formatted)
+        try:
+            sys.stderr.write("\n=== Ganger unhandled exception ===\n")
+            sys.stderr.write(formatted)
+            sys.stderr.flush()
+        except Exception:
+            pass
+        self._return_code = 1
+        self.exit(return_code=1)
+
     def _select_folder(self, folder_id: Optional[str] = None) -> None:
         """Select a folder by id, or fall back to the first folder."""
         if not self.miller_view or not self.miller_view.folder_column or not self.folders:
@@ -202,7 +242,6 @@ class GangerApp(App):
                     break
 
         self.miller_view.folder_column.selected_index = selected_index
-        self.post_message(FolderSelected(self.folders[selected_index]))
 
     async def on_mount(self) -> None:
         """Initialize the application after mounting."""
@@ -244,6 +283,22 @@ class GangerApp(App):
             self.notify(f"Initialization error: {e}", severity="error")
             self.exit(1)
 
+    async def _cache_is_fresh(self) -> bool:
+        """Return True if the starred-repo cache is within its TTL.
+
+        Uses the canonical sync-completion timestamp written by
+        set_starred_sync_state — not MAX(cached_at), which is an unreliable
+        proxy when incremental syncs upsert rows at staggered times.
+        """
+        if not self.cache:
+            return False
+        sync_state = await self.cache.get_starred_sync_state()
+        updated_at = sync_state["updated_at"]
+        if not sync_state["complete"] or updated_at is None:
+            return False
+        age = (datetime.now() - updated_at).total_seconds()
+        return age < self.settings.cache.repos_ttl
+
     async def _load_cached_data(self) -> None:
         """Load cached folders/repos for immediate display."""
         try:
@@ -273,6 +328,16 @@ class GangerApp(App):
 
             # Load fresh data if authenticated
             if self.api_client:
+                # Skip the API refresh if the cache is already fresh. The user
+                # was reporting "sometimes reloads all stars on startup" — the
+                # culprit was that we re-entered initialize_data unconditionally
+                # and re-evaluated freshness inside load_starred_repos, which
+                # could mis-fire. Decide here, once, with the canonical metadata.
+                if await self._cache_is_fresh():
+                    if self.status_bar:
+                        self.status_bar.update_status("Ready (cached)", "")
+                    logger.info("Starred-repo cache is fresh; skipping API sync")
+                    return
                 await self.initialize_data()
             else:
                 # No API client - stay in offline mode
@@ -485,7 +550,10 @@ class GangerApp(App):
         if not self.current_folder or not self.folder_manager or not self.miller_view:
             return
 
+        # Bypass and refresh the in-memory cache for this folder.
+        self._folder_repos_cache.pop(self.current_folder.id, None)
         self.current_repos = await self.folder_manager.get_folder_repos(self.current_folder.id)
+        self._folder_repos_cache[self.current_folder.id] = self.current_repos
         await self.miller_view.set_repos(self.current_repos)
 
         if self.status_bar:
@@ -500,6 +568,10 @@ class GangerApp(App):
             if not self.folder_manager:
                 logger.error("Folder manager not initialized")
                 return
+
+            # Folder set or counts may have changed; the per-folder repo cache
+            # is now potentially stale.
+            self._folder_repos_cache.clear()
 
             # Get all folders
             self.folders = await self.folder_manager.get_all_folders()
@@ -600,7 +672,6 @@ class GangerApp(App):
             # Auto-select first folder
             if self.miller_view and self.miller_view.folder_column and self.folders:
                 self.miller_view.folder_column.selected_index = 0
-                self.post_message(FolderSelected(self.folders[0]))
 
             self.notify(f"Deleted folder '{self.current_folder.name}'", timeout=2)
             self.current_folder = None
@@ -694,13 +765,23 @@ class GangerApp(App):
                 return
 
             self.current_folder = message.folder
+            folder_id = message.folder.id
 
-            # Show loading indicator for folder with many repos
-            if self.status_bar:
-                self.status_bar.update_status(f"Loading {message.folder.name}...", "")
-
-            # Get repos in this folder (lazy load on-demand)
-            self.current_repos = await self.folder_manager.get_folder_repos(message.folder.id)
+            # Hit the in-memory cache before SQLite. j/k navigation typically
+            # revisits the same handful of folders; SQLite + StarredRepo
+            # deserialization is wasted work after the first visit.
+            cached_repos = self._folder_repos_cache.get(folder_id)
+            if cached_repos is not None:
+                self.current_repos = cached_repos
+            else:
+                if self.status_bar:
+                    self.status_bar.update_status(
+                        f"Loading {message.folder.name}...", ""
+                    )
+                self.current_repos = await self.folder_manager.get_folder_repos(
+                    folder_id
+                )
+                self._folder_repos_cache[folder_id] = self.current_repos
 
             # Update MillerView
             if self.miller_view:

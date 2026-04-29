@@ -80,11 +80,34 @@ class DataLoader:
         """
         try:
             # Try cache first unless force refresh
+            sync_state = await self.cache.get_starred_sync_state()
             if not force_refresh:
                 cached_repos = await self.cache.get_starred_repos()
                 if cached_repos:
-                    logger.info(f"Loaded {len(cached_repos)} repos from cache")
-                    return cached_repos
+                    can_resume_incrementally = hasattr(type(self.api_client), "get_starred_repos_page")
+                    if sync_state["complete"] or not can_resume_incrementally:
+                        logger.info(f"Loaded {len(cached_repos)} repos from cache")
+                        return cached_repos
+
+                    logger.info(
+                        "Resuming starred repo sync from cached snapshot at %s/%s",
+                        len(cached_repos),
+                        sync_state["total_count"] or "?",
+                    )
+                    repos = await self._load_starred_repos_incrementally(
+                        start_cursor=sync_state["cursor"],
+                        existing_repos=cached_repos,
+                        total_count=sync_state["total_count"],
+                    )
+                    logger.info(f"Fetched {len(repos)} starred repos from GitHub")
+                    return repos
+
+            await self.cache.set_starred_sync_state(
+                cached_count=0,
+                total_count=None,
+                cursor=None,
+                complete=False,
+            )
 
             used_incremental_cache = False
             if hasattr(type(self.api_client), "get_starred_repos_page"):
@@ -121,12 +144,19 @@ class DataLoader:
                 return cached_repos
             raise
 
-    async def _load_starred_repos_incrementally(self) -> List[StarredRepo]:
+    async def _load_starred_repos_incrementally(
+        self,
+        start_cursor: Optional[str] = None,
+        existing_repos: Optional[List[StarredRepo]] = None,
+        total_count: Optional[int] = None,
+    ) -> List[StarredRepo]:
         """Fetch starred repos page by page so the TUI can update mid-sync."""
-        repos: List[StarredRepo] = []
-        repo_ids = set()
-        cursor: Optional[str] = None
-        total_count: Optional[int] = None
+        repo_map = {repo.id: repo for repo in (existing_repos or [])}
+        repo_ids = set(repo_map)
+        cursor = start_cursor
+
+        if repo_ids:
+            await self._report_repo_sync(len(repo_ids), total_count)
 
         while True:
             page = await asyncio.to_thread(
@@ -139,8 +169,16 @@ class DataLoader:
 
             if page_repos:
                 await self.cache.upsert_starred_repos(page_repos)
-                repos.extend(page_repos)
-                repo_ids.update(repo.id for repo in page_repos)
+                for repo in page_repos:
+                    repo_map[repo.id] = repo
+                    repo_ids.add(repo.id)
+
+            await self.cache.set_starred_sync_state(
+                cached_count=len(repo_ids),
+                total_count=total_count,
+                cursor=page["end_cursor"],
+                complete=not page["has_next_page"],
+            )
 
             if total_count and total_count > 0:
                 await self._report_progress("Syncing", len(repo_ids), total_count)
@@ -152,7 +190,15 @@ class DataLoader:
             cursor = page["end_cursor"]
 
         await self.cache.prune_starred_repos(repo_ids)
-        return repos
+        await self.cache.set_starred_sync_state(
+            cached_count=len(repo_ids),
+            total_count=total_count or len(repo_ids),
+            cursor=None,
+            complete=True,
+        )
+
+        refreshed_repos = await self.cache.get_starred_repos(force_refresh=True)
+        return refreshed_repos or []
 
     async def ensure_default_folders(self) -> List[VirtualFolder]:
         """Create default folders if they don't exist.

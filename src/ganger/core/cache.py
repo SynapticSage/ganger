@@ -34,6 +34,11 @@ class PersistentCache:
 
     # Schema version for migrations
     SCHEMA_VERSION = 2
+    STARRED_SYNC_CURSOR_KEY = "starred_sync_cursor"
+    STARRED_SYNC_CACHED_COUNT_KEY = "starred_sync_cached_count"
+    STARRED_SYNC_TOTAL_COUNT_KEY = "starred_sync_total_count"
+    STARRED_SYNC_COMPLETE_KEY = "starred_sync_complete"
+    STARRED_SYNC_UPDATED_AT_KEY = "starred_sync_updated_at"
 
     def __init__(self, db_path: Optional[Path] = None, ttl_seconds: int = 3600):
         """
@@ -257,15 +262,20 @@ class PersistentCache:
             List of StarredRepo objects, or None if cache expired/empty
         """
         async with self._connect(row_factory=aiosqlite.Row) as db:
-            # Check if cache is expired
+            # Check if cache is expired. Use the sync-completion timestamp as the
+            # freshness marker — NOT MAX(cached_at) across rows. Incremental syncs
+            # write rows with staggered timestamps, so any single old row would
+            # otherwise expire the whole cache. If the metadata key is missing
+            # (migrated DB or never-synced state) we trust the cache; the next
+            # successful sync will populate the key.
             if not force_refresh:
-                cursor = await db.execute(
-                    "SELECT MIN(cached_at) as oldest FROM starred_repos"
+                sync_updated_at = await self._get_metadata_value(
+                    db,
+                    self.STARRED_SYNC_UPDATED_AT_KEY,
                 )
-                row = await cursor.fetchone()
-                if row and row["oldest"]:
-                    oldest_time = datetime.fromisoformat(row["oldest"])
-                    if datetime.now() - oldest_time > timedelta(seconds=self.ttl_seconds):
+                if sync_updated_at:
+                    newest_time = datetime.fromisoformat(sync_updated_at)
+                    if datetime.now() - newest_time > timedelta(seconds=self.ttl_seconds):
                         return None  # Cache expired
 
             # Get all repos
@@ -297,6 +307,12 @@ class PersistentCache:
         await self.upsert_starred_repos(repos)
         if prune_missing:
             await self.prune_starred_repos(repo.id for repo in repos)
+        await self.set_starred_sync_state(
+            cached_count=len(repos),
+            total_count=len(repos),
+            cursor=None,
+            complete=True,
+        )
 
     async def upsert_starred_repos(self, repos: List[StarredRepo]) -> None:
         """Insert or update a batch of cached starred repos without pruning."""
@@ -381,6 +397,77 @@ class PersistentCache:
                 accessed_at = excluded.accessed_at
         """, rows)
 
+    @staticmethod
+    async def _get_metadata_value(
+        db: aiosqlite.Connection,
+        key: str,
+    ) -> Optional[str]:
+        """Read a single metadata value using an existing connection."""
+        cursor = await db.execute("SELECT value FROM metadata WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return row[0]
+
+    async def get_starred_sync_state(self) -> Dict[str, Any]:
+        """Return resumable sync metadata for starred repo collection."""
+        async with self._connect(row_factory=aiosqlite.Row) as db:
+            cursor = await db.execute("""
+                SELECT key, value FROM metadata
+                WHERE key IN (?, ?, ?, ?, ?)
+            """, (
+                self.STARRED_SYNC_CURSOR_KEY,
+                self.STARRED_SYNC_CACHED_COUNT_KEY,
+                self.STARRED_SYNC_TOTAL_COUNT_KEY,
+                self.STARRED_SYNC_COMPLETE_KEY,
+                self.STARRED_SYNC_UPDATED_AT_KEY,
+            ))
+            rows = await cursor.fetchall()
+
+        values = {row["key"]: row["value"] for row in rows}
+
+        def _to_int(value: Optional[str]) -> Optional[int]:
+            if value is None or value == "":
+                return None
+            return int(value)
+
+        updated_at = values.get(self.STARRED_SYNC_UPDATED_AT_KEY)
+        return {
+            "cursor": values.get(self.STARRED_SYNC_CURSOR_KEY) or None,
+            "cached_count": _to_int(values.get(self.STARRED_SYNC_CACHED_COUNT_KEY)) or 0,
+            "total_count": _to_int(values.get(self.STARRED_SYNC_TOTAL_COUNT_KEY)),
+            "complete": values.get(self.STARRED_SYNC_COMPLETE_KEY) == "1",
+            "updated_at": datetime.fromisoformat(updated_at) if updated_at else None,
+        }
+
+    async def set_starred_sync_state(
+        self,
+        *,
+        cached_count: int,
+        total_count: Optional[int],
+        cursor: Optional[str],
+        complete: bool,
+    ) -> None:
+        """Persist resumable sync metadata for starred repo collection."""
+        updated_at = datetime.now().isoformat()
+        entries = (
+            (self.STARRED_SYNC_CURSOR_KEY, cursor or ""),
+            (self.STARRED_SYNC_CACHED_COUNT_KEY, str(cached_count)),
+            (
+                self.STARRED_SYNC_TOTAL_COUNT_KEY,
+                "" if total_count is None else str(total_count),
+            ),
+            (self.STARRED_SYNC_COMPLETE_KEY, "1" if complete else "0"),
+            (self.STARRED_SYNC_UPDATED_AT_KEY, updated_at),
+        )
+
+        async with self._connect() as db:
+            await db.executemany(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                entries,
+            )
+            await db.commit()
+
     async def get_repo(self, repo_id: str) -> Optional[StarredRepo]:
         """
         Get a single repo by ID.
@@ -413,6 +500,16 @@ class PersistentCache:
         async with self._connect() as db:
             await db.execute("DELETE FROM repo_metadata")
             await db.execute("DELETE FROM starred_repos")
+            await db.executemany(
+                "DELETE FROM metadata WHERE key = ?",
+                (
+                    (self.STARRED_SYNC_CURSOR_KEY,),
+                    (self.STARRED_SYNC_CACHED_COUNT_KEY,),
+                    (self.STARRED_SYNC_TOTAL_COUNT_KEY,),
+                    (self.STARRED_SYNC_COMPLETE_KEY,),
+                    (self.STARRED_SYNC_UPDATED_AT_KEY,),
+                ),
+            )
             await db.commit()
 
     # ==================== Virtual Folders Operations ====================
