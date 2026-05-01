@@ -52,6 +52,14 @@ class StarredRepo:
     default_branch: str = "main"
     license: Optional[str] = None
 
+    # User-defined tags (separate from GitHub-sourced `topics`). Loaded from
+    # the user_tags table; not stored on the starred_repos row.
+    user_tags: List[str] = field(default_factory=list)
+    # True for placeholder rows inserted by import when the referenced repo
+    # isn't in the local cache. Sync upgrades these in place via
+    # cache.upsert_starred_repos.
+    is_stub: bool = False
+
     # UI state (not persisted to GitHub)
     is_selected: bool = False
     is_focused: bool = False
@@ -119,6 +127,18 @@ class StarredRepo:
 
             data["topics"] = json.loads(data["topics"])
 
+        # user_tags may arrive as a JSON string (export envelope) or be absent
+        # (cache row — populated separately via the user_tags table).
+        if "user_tags" in data and isinstance(data["user_tags"], str):
+            import json
+
+            data["user_tags"] = json.loads(data["user_tags"])
+
+        # SQLite stores BOOLEAN as INTEGER; coerce so the dataclass field is
+        # genuinely a bool.
+        if "is_stub" in data and not isinstance(data["is_stub"], bool):
+            data["is_stub"] = bool(data["is_stub"])
+
         return cls(**data)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -148,6 +168,7 @@ class StarredRepo:
             "homepage": self.homepage,
             "default_branch": self.default_branch,
             "license": self.license,
+            "is_stub": int(self.is_stub),  # SQLite stores BOOLEAN as 0/1
         }
         return data
 
@@ -197,6 +218,12 @@ class VirtualFolder:
     description: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Discriminator (added in v3 schema). Allowed values:
+    #   "rule"    — auto-tag rule, no manual links, sorted by stars
+    #   "curated" — hand-curated, ordered via folder_repos.position
+    #   "hybrid"  — auto-tag rule plus manual additions
+    #   "system"  — synthetic (e.g. all-stars); not user-creatable
+    kind: str = "curated"
 
     # Computed fields (not stored)
     repo_count: int = 0
@@ -244,6 +271,7 @@ class VirtualFolder:
             "description": self.description,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "kind": self.kind,
         }
 
     def matches_repo(self, repo: StarredRepo) -> bool:
@@ -396,6 +424,9 @@ class FolderRepoLink:
     repo_id: str
     is_manual: bool = False  # True if manually added, False if auto-matched
     added_at: Optional[datetime] = None
+    # Stable ordering position (added in v3). Used by curated/hybrid folders;
+    # NULL for rule/system folder links.
+    position: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "FolderRepoLink":
@@ -412,4 +443,5 @@ class FolderRepoLink:
             "repo_id": self.repo_id,
             "is_manual": self.is_manual,
             "added_at": self.added_at.isoformat() if self.added_at else None,
+            "position": self.position,
         }

@@ -66,3 +66,6 @@ logs/
 tmp/
 temp/
 *.tmp
+
+# Codex skill state (pane ID, session ID, transient prompts)
+.context/

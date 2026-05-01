@@ -32,8 +32,16 @@ class PersistentCache:
     - repo_metadata: Extended metadata (README, issues, etc.)
     """
 
-    # Schema version for migrations
-    SCHEMA_VERSION = 2
+    # Schema version for migrations.
+    # Bumping this triggers a v(N-1)->vN migration step on existing DBs the
+    # next time initialize() runs. New steps must be idempotent and added to
+    # the dispatcher in initialize().
+    SCHEMA_VERSION = 3
+
+    # Allowed VirtualFolder.kind values. "system" is internal-only; cache
+    # validation rejects external attempts to create system folders.
+    ALLOWED_FOLDER_KINDS = ("rule", "curated", "hybrid", "system")
+
     STARRED_SYNC_CURSOR_KEY = "starred_sync_cursor"
     STARRED_SYNC_CACHED_COUNT_KEY = "starred_sync_cached_count"
     STARRED_SYNC_TOTAL_COUNT_KEY = "starred_sync_total_count"
@@ -120,6 +128,108 @@ class PersistentCache:
         logger.info("Migrated cache schema from v1 to v2")
 
     @staticmethod
+    async def _safe_add_column(
+        db: aiosqlite.Connection,
+        table: str,
+        column: str,
+        definition: str,
+    ) -> bool:
+        """Idempotently add a column to a table.
+
+        Returns True if the column was added, False if it already existed.
+        Reads PRAGMA table_info first instead of catching OperationalError
+        on duplicate column — try/except would silently swallow other
+        legitimate failures.
+        """
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        rows = await cursor.fetchall()
+        existing = {row[1] for row in rows}
+        if column in existing:
+            return False
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        return True
+
+    @staticmethod
+    async def _migrate_v2_to_v3(db: aiosqlite.Connection) -> None:
+        """Add kind/position/is_stub columns and the user_tags table.
+
+        Backfill kind per the richer enum decision (2026-04-28):
+          - non-empty auto_tags AND any manual folder_repos link  -> 'hybrid'
+          - non-empty auto_tags, no manual links                  -> 'rule'
+          - id == 'all-stars' (or any other reserved system id)   -> 'system'
+          - everything else (default already 'curated')           -> 'curated'
+
+        All steps are idempotent so a partial migration can be re-run safely.
+        """
+        # 1. Folder kind discriminator. DEFAULT 'curated' covers fresh inserts;
+        #    backfill rules below override for existing rows.
+        await PersistentCache._safe_add_column(
+            db, "virtual_folders", "kind", "TEXT NOT NULL DEFAULT 'curated'"
+        )
+
+        # 2. Hybrid: has auto_tags AND at least one manual folder_repos link.
+        await db.execute("""
+            UPDATE virtual_folders
+               SET kind = 'hybrid'
+             WHERE auto_tags IS NOT NULL
+               AND auto_tags <> '[]'
+               AND auto_tags <> ''
+               AND id IN (SELECT DISTINCT folder_id FROM folder_repos WHERE is_manual = 1)
+        """)
+
+        # 3. Rule: has auto_tags, no manual links (and not already hybrid).
+        await db.execute("""
+            UPDATE virtual_folders
+               SET kind = 'rule'
+             WHERE auto_tags IS NOT NULL
+               AND auto_tags <> '[]'
+               AND auto_tags <> ''
+               AND kind <> 'hybrid'
+        """)
+
+        # 4. System: synthetic folders. Currently just all-stars; the IN clause
+        #    is here so future system ids only need to be added once.
+        await db.execute("""
+            UPDATE virtual_folders
+               SET kind = 'system'
+             WHERE id IN ('all-stars')
+        """)
+
+        # 5. Stable ordering for manual links in curated/hybrid folders.
+        await PersistentCache._safe_add_column(
+            db, "folder_repos", "position", "INTEGER"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_folder_repos_position "
+            "ON folder_repos(folder_id, position)"
+        )
+
+        # 6. Stub flag: rows inserted from imports referencing repos the user
+        #    hasn't actually starred. Sync upgrades these in place.
+        await PersistentCache._safe_add_column(
+            db, "starred_repos", "is_stub", "BOOLEAN DEFAULT 0"
+        )
+
+        # 7. User-defined tags (separate from GitHub-sourced topics).
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_tags (
+                repo_id  TEXT NOT NULL,
+                tag      TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                PRIMARY KEY (repo_id, tag),
+                FOREIGN KEY (repo_id) REFERENCES starred_repos(id) ON DELETE CASCADE
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_tags_repo ON user_tags(repo_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_tags_tag ON user_tags(tag)"
+        )
+
+        logger.info("Migrated cache schema from v2 to v3")
+
+    @staticmethod
     async def _cleanup_orphaned_folder_links(db: aiosqlite.Connection) -> None:
         """Remove stale folder links left behind by older cache semantics."""
         await db.execute("""
@@ -154,6 +264,9 @@ class PersistentCache:
             await db.execute("PRAGMA foreign_keys = ON")
 
             # Table: starred_repos
+            # NOTE: is_stub (added in v3) marks placeholder rows from imports
+            # referencing repos the user hasn't actually starred yet. Sync
+            # upgrades them in place via upsert_starred_repos.
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS starred_repos (
                     id TEXT PRIMARY KEY,
@@ -179,11 +292,14 @@ class PersistentCache:
                     default_branch TEXT DEFAULT 'main',
                     license TEXT,
                     cached_at TEXT NOT NULL,
-                    accessed_at TEXT
+                    accessed_at TEXT,
+                    is_stub BOOLEAN DEFAULT 0
                 )
             """)
 
             # Table: virtual_folders
+            # NOTE: kind (added in v3) discriminates organization mode.
+            # Allowed values defined by ALLOWED_FOLDER_KINDS.
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS virtual_folders (
                     id TEXT PRIMARY KEY,
@@ -191,19 +307,34 @@ class PersistentCache:
                     auto_tags TEXT,
                     description TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT
+                    updated_at TEXT,
+                    kind TEXT NOT NULL DEFAULT 'curated'
                 )
             """)
 
             # Table: folder_repos (many-to-many relationship)
+            # NOTE: position (added in v3) provides stable ordering for
+            # curated/hybrid folders. NULL for rule/system links.
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS folder_repos (
                     folder_id TEXT NOT NULL,
                     repo_id TEXT NOT NULL,
                     is_manual BOOLEAN DEFAULT 0,
                     added_at TEXT NOT NULL,
+                    position INTEGER,
                     PRIMARY KEY (folder_id, repo_id),
                     FOREIGN KEY (folder_id) REFERENCES virtual_folders(id) ON DELETE CASCADE,
+                    FOREIGN KEY (repo_id) REFERENCES starred_repos(id) ON DELETE CASCADE
+                )
+            """)
+
+            # Table: user_tags (added in v3)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS user_tags (
+                    repo_id  TEXT NOT NULL,
+                    tag      TEXT NOT NULL,
+                    added_at TEXT NOT NULL,
+                    PRIMARY KEY (repo_id, tag),
                     FOREIGN KEY (repo_id) REFERENCES starred_repos(id) ON DELETE CASCADE
                 )
             """)
@@ -223,7 +354,9 @@ class PersistentCache:
                 )
             """)
 
-            # Indexes for performance
+            # Indexes for performance. Only v1/v2 indexes here; v3 indexes
+            # depend on columns that older DBs gain via _migrate_v2_to_v3, so
+            # they're created AFTER the migration loop below.
             await db.execute("CREATE INDEX IF NOT EXISTS idx_repo_language ON starred_repos(language)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_repo_updated ON starred_repos(updated_at)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_repo_stars ON starred_repos(stars_count)")
@@ -236,9 +369,40 @@ class PersistentCache:
                     value TEXT
                 )
             """)
+            # Migration dispatcher: walk current_version up to SCHEMA_VERSION,
+            # one step at a time. v0 = unstamped (fresh DB or pre-versioning);
+            # base CREATE above already populated everything, so it's a no-op
+            # bump. Each migration must be idempotent so a retry after a
+            # partial failure doesn't double-apply.
             current_version = await self._get_schema_version(db)
-            if current_version == 1:
-                await self._migrate_v1_to_v2(db)
+            while current_version < self.SCHEMA_VERSION:
+                if current_version == 0:
+                    pass  # base CREATE handled it
+                elif current_version == 1:
+                    await self._migrate_v1_to_v2(db)
+                elif current_version == 2:
+                    await self._migrate_v2_to_v3(db)
+                else:
+                    logger.warning(
+                        "No migration handler for schema_version=%d; aborting",
+                        current_version,
+                    )
+                    break
+                current_version += 1
+
+            # v3 indexes — guaranteed safe here because either the base CREATE
+            # (fresh DB) or _migrate_v2_to_v3 (existing DB) has now produced
+            # the position column and the user_tags table.
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_folder_repos_position "
+                "ON folder_repos(folder_id, position)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_tags_repo ON user_tags(repo_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_user_tags_tag ON user_tags(tag)"
+            )
 
             await self._cleanup_orphaned_folder_links(db)
 
