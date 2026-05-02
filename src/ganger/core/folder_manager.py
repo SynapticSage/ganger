@@ -44,32 +44,82 @@ class FolderManager:
         return await self.cache.get_virtual_folders()
 
     async def create_folder(
-        self, name: str, auto_tags: Optional[List[str]] = None, description: str = ""
+        self,
+        name: str,
+        auto_tags: Optional[List[str]] = None,
+        description: str = "",
+        kind: Optional[str] = None,
     ) -> VirtualFolder:
         """
-        Create a new virtual folder.
+        Create a new virtual folder with kind-specific validation.
+
+        Validation rules:
+        - ``rule`` / ``hybrid`` require non-empty ``auto_tags``.
+        - ``curated`` rejects ``auto_tags`` (must be empty or None).
+        - ``system`` is reserved for internal use; external callers cannot
+          create system folders. The cache layer enforces this independently.
+
+        ``kind`` may be omitted; in that case it's inferred from ``auto_tags``
+        (non-empty -> ``rule``, otherwise ``curated``). This preserves the
+        legacy two-arg signature ``create_folder(name, auto_tags=...)``.
 
         Args:
             name: Folder name
-            auto_tags: Tags for auto-matching repos (e.g., ["python", "ml"])
+            auto_tags: Tags for auto-matching repos. Required for rule/hybrid,
+                forbidden for curated.
             description: Optional folder description
+            kind: Folder kind - "rule", "curated", or "hybrid". If None,
+                inferred from auto_tags.
 
         Returns:
             Created VirtualFolder object
 
         Raises:
-            CacheError: If folder with same name exists
+            CacheError: If folder with same name exists, kind is invalid, or
+                kind/auto_tags combination violates the rules above.
         """
+        tags = auto_tags or []
+
+        if kind is None:
+            kind = "rule" if tags else "curated"
+
+        if kind == "system":
+            raise CacheError(
+                "Cannot create system folders from the service layer. "
+                "They are managed internally (e.g. all-stars)."
+            )
+        if kind not in ("rule", "curated", "hybrid"):
+            raise CacheError(
+                f"Invalid folder kind '{kind}'. "
+                f"Allowed for create_folder: rule, curated, hybrid"
+            )
+
+        if kind in ("rule", "hybrid") and not tags:
+            raise CacheError(
+                f"kind='{kind}' folders require non-empty auto_tags"
+            )
+        if kind == "curated" and tags:
+            raise CacheError(
+                "kind='curated' folders cannot have auto_tags. "
+                "Use kind='hybrid' if you want both manual and auto entries."
+            )
+
         folder = VirtualFolder(
             id=str(uuid.uuid4()),
             name=name,
-            auto_tags=auto_tags or [],
+            auto_tags=tags,
             description=description,
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
+            kind=kind,
         )
 
         return await self.cache.create_virtual_folder(folder)
+
+    async def list_folders_by_kind(self, kind: str) -> List[VirtualFolder]:
+        """Return folders filtered by kind."""
+        all_folders = await self.cache.get_virtual_folders()
+        return [f for f in all_folders if f.kind == kind]
 
     async def delete_folder(self, folder_id: str) -> None:
         """
@@ -168,9 +218,13 @@ class FolderManager:
             if repos is None:
                 repos = []
 
-        # Get folders with auto_tags
+        # Auto-categorization only applies to rule/hybrid folders. Curated
+        # folders are user-curated by definition; system folders manage their
+        # own membership.
         folders = await self.cache.get_virtual_folders()
-        folders_with_tags = [f for f in folders if f.auto_tags]
+        folders_with_tags = [
+            f for f in folders if f.auto_tags and f.kind in ("rule", "hybrid")
+        ]
 
         stats = {}
 
@@ -204,7 +258,9 @@ class FolderManager:
             List of folder IDs the repo was added to
         """
         folders = await self.cache.get_virtual_folders()
-        folders_with_tags = [f for f in folders if f.auto_tags]
+        folders_with_tags = [
+            f for f in folders if f.auto_tags and f.kind in ("rule", "hybrid")
+        ]
 
         matched_folder_ids = []
 
@@ -236,10 +292,16 @@ class FolderManager:
         created = []
 
         for folder_config in default_folders:
+            tags = folder_config.get("auto_tags", []) or []
+            # Default-folder configs from config.yaml are auto-tag-driven, so
+            # they're "rule" folders unless explicitly overridden. The "kind"
+            # key in a folder_config is honored if present.
+            kind = folder_config.get("kind") or ("rule" if tags else "curated")
             try:
                 folder = await self.create_folder(
                     name=folder_config["name"],
-                    auto_tags=folder_config.get("auto_tags", []),
+                    kind=kind,
+                    auto_tags=tags,
                     description=folder_config.get("description", ""),
                 )
                 created.append(folder)

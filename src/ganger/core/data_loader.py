@@ -216,15 +216,17 @@ class DataLoader:
             all_stars_exists = any(f.name == "All Stars" for f in existing_folders)
 
             if not all_stars_exists:
-                # Create "All Stars" folder
+                # Create "All Stars" folder. ``_internal=True`` is required
+                # because kind="system" is reserved for cache-internal callers.
                 all_stars = VirtualFolder(
                     id="all-stars",
                     name="All Stars",
-                    auto_tags=[],  # No auto-tags, manually synced
+                    auto_tags=[],
                     repo_count=0,
+                    kind="system",
                 )
                 try:
-                    await self.cache.create_virtual_folder(all_stars)
+                    await self.cache.create_virtual_folder(all_stars, _internal=True)
                     logger.info("Created 'All Stars' folder")
                 except CacheError as e:
                     # Folder already exists (race condition or concurrent creation)
@@ -239,11 +241,19 @@ class DataLoader:
                     # Check if folder already exists
                     exists = any(f.name == name for f in existing_folders)
                     if not exists:
+                        # Default folders from config are auto-tag-driven, so
+                        # they're "rule" folders. The startup repair pass
+                        # would correct this anyway, but emitting the right
+                        # kind up front avoids the round trip.
+                        kind = folder_config.get("kind") or (
+                            "rule" if auto_tags else "curated"
+                        )
                         folder = VirtualFolder(
                             id=name.lower().replace(" ", "-"),
                             name=name,
                             auto_tags=auto_tags,
                             repo_count=0,
+                            kind=kind,
                         )
                         try:
                             await self.cache.create_virtual_folder(folder)

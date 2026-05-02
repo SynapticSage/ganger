@@ -230,6 +230,47 @@ class PersistentCache:
         logger.info("Migrated cache schema from v2 to v3")
 
     @staticmethod
+    async def _repair_folder_kinds(db: aiosqlite.Connection) -> None:
+        """Idempotent kind repair — runs on every initialize().
+
+        Slice 1 of the v3 rollout shipped the schema migration but did not
+        teach create_virtual_folder to set ``kind``, so any folder created by
+        the v3-aware code between slice 1 and slice 2A landed at the
+        ``DEFAULT 'curated'``. This pass catches those rows. It is safe to
+        run on every startup because each UPDATE is gated by ``kind <> ...``
+        — already-correct rows are not touched.
+        """
+        # all-stars (and any other reserved system id) -> system
+        await db.execute("""
+            UPDATE virtual_folders
+               SET kind = 'system'
+             WHERE id IN ('all-stars')
+               AND kind <> 'system'
+        """)
+
+        # Has auto_tags AND any manual link -> hybrid
+        await db.execute("""
+            UPDATE virtual_folders
+               SET kind = 'hybrid'
+             WHERE auto_tags IS NOT NULL
+               AND auto_tags <> '[]'
+               AND auto_tags <> ''
+               AND kind <> 'system'
+               AND kind <> 'hybrid'
+               AND id IN (SELECT DISTINCT folder_id FROM folder_repos WHERE is_manual = 1)
+        """)
+
+        # Has auto_tags, no manual links, not already rule/hybrid/system -> rule
+        await db.execute("""
+            UPDATE virtual_folders
+               SET kind = 'rule'
+             WHERE auto_tags IS NOT NULL
+               AND auto_tags <> '[]'
+               AND auto_tags <> ''
+               AND kind = 'curated'
+        """)
+
+    @staticmethod
     async def _cleanup_orphaned_folder_links(db: aiosqlite.Connection) -> None:
         """Remove stale folder links left behind by older cache semantics."""
         await db.execute("""
@@ -404,6 +445,9 @@ class PersistentCache:
                 "CREATE INDEX IF NOT EXISTS idx_user_tags_tag ON user_tags(tag)"
             )
 
+            # Idempotent kind repair — runs every startup. See docstring.
+            await self._repair_folder_kinds(db)
+
             await self._cleanup_orphaned_folder_links(db)
 
             await db.execute(
@@ -449,11 +493,8 @@ class PersistentCache:
             if not rows:
                 return None
 
-            repos = []
-            for row in rows:
-                repo_dict = dict(row)
-                repos.append(StarredRepo.from_dict(repo_dict))
-
+            repos = [StarredRepo.from_dict(dict(row)) for row in rows]
+            await self._hydrate_user_tags(db, repos)
             return repos
 
     async def set_starred_repos(
@@ -657,7 +698,9 @@ class PersistentCache:
             )
             await db.commit()
 
-            return StarredRepo.from_dict(dict(row))
+            repo = StarredRepo.from_dict(dict(row))
+            await self._hydrate_user_tags(db, [repo])
+            return repo
 
     async def invalidate_repos(self) -> None:
         """Invalidate (clear) all starred repos from cache."""
@@ -713,24 +756,51 @@ class PersistentCache:
             return folders
 
     async def create_virtual_folder(
-        self, folder: VirtualFolder
+        self,
+        folder: VirtualFolder,
+        *,
+        _internal: bool = False,
     ) -> VirtualFolder:
         """
         Create a new virtual folder.
 
         Args:
             folder: VirtualFolder object to create
+            _internal: True only when this call originates from cache-internal
+                code (the v3 migration / startup repair). Required to insert
+                ``kind="system"``; external callers always use ``_internal=False``
+                and may not create system folders.
 
         Returns:
             Created VirtualFolder object
 
         Raises:
-            CacheError: If folder with same name exists
+            CacheError: If folder with same name exists, kind is not allowed,
+                or kind="system" is requested by an external caller.
         """
+        # Reserved IDs always land at kind="system". This catches legacy
+        # callers that create the all-stars folder without specifying kind,
+        # and ensures the data invariant (all-stars is system) holds even if
+        # the caller forgets to set kind. The startup repair pass also fixes
+        # this, but doing it at insert time avoids an inconsistent window.
+        if folder.id in ("all-stars",):
+            folder.kind = "system"
+            _internal = True
+
+        if folder.kind not in self.ALLOWED_FOLDER_KINDS:
+            raise CacheError(
+                f"Invalid folder kind '{folder.kind}'. "
+                f"Allowed: {self.ALLOWED_FOLDER_KINDS}"
+            )
+        if folder.kind == "system" and not _internal:
+            raise CacheError(
+                "kind='system' folders are reserved for internal use "
+                "(e.g. all-stars). External callers cannot create them."
+            )
+
         async with self._connect() as db:
             data = folder.to_dict()
 
-            # Set created_at/updated_at if not provided
             now = datetime.now().isoformat()
             if data["created_at"] is None:
                 data["created_at"] = now
@@ -739,8 +809,10 @@ class PersistentCache:
 
             try:
                 await db.execute("""
-                    INSERT INTO virtual_folders (id, name, auto_tags, description, created_at, updated_at)
-                    VALUES (:id, :name, :auto_tags, :description, :created_at, :updated_at)
+                    INSERT INTO virtual_folders
+                        (id, name, auto_tags, description, created_at, updated_at, kind)
+                    VALUES
+                        (:id, :name, :auto_tags, :description, :created_at, :updated_at, :kind)
                 """, data)
                 await db.commit()
             except aiosqlite.IntegrityError:
@@ -762,32 +834,155 @@ class PersistentCache:
 
     async def get_folder_repos(self, folder_id: str) -> List[StarredRepo]:
         """
-        Get all repos in a virtual folder.
+        Get all repos in a virtual folder, dispatching on folder kind.
 
-        Args:
-            folder_id: Folder ID
+        - ``rule``    — repos matching ``auto_tags`` via ``topics``, ordered by
+          ``stars_count DESC``. ``folder_repos`` rows are ignored.
+        - ``curated`` — repos in ``folder_repos`` only, ordered by
+          ``position ASC NULLS LAST``, then ``stars_count DESC``.
+          ``auto_tags`` is ignored.
+        - ``hybrid``  — manually-linked repos first (ordered by ``position``,
+          then stars), followed by auto-tag matches not already manually
+          present. Dedup by repo id.
+        - ``system``  — dispatch by id. ``all-stars`` -> all starred repos.
+          Unknown system ids raise ``CacheError``.
 
-        Returns:
-            List of StarredRepo objects in this folder
+        All branches hydrate ``user_tags`` via a single keyed query.
         """
         async with self._connect(row_factory=aiosqlite.Row) as db:
-            if folder_id == "all-stars":
-                cursor = await db.execute("""
-                    SELECT * FROM starred_repos
-                    ORDER BY stars_count DESC
-                """)
-                rows = await cursor.fetchall()
-                return [StarredRepo.from_dict(dict(row)) for row in rows]
+            cursor = await db.execute(
+                "SELECT id, auto_tags, kind FROM virtual_folders WHERE id = ?",
+                (folder_id,),
+            )
+            row = await cursor.fetchone()
 
-            cursor = await db.execute("""
-                SELECT r.* FROM starred_repos r
-                JOIN folder_repos fr ON r.id = fr.repo_id
-                WHERE fr.folder_id = ?
-                ORDER BY r.stars_count DESC
-            """, (folder_id,))
-            rows = await cursor.fetchall()
+            # Backward-compat: if the folder doesn't exist as a row but the
+            # caller passed "all-stars", treat it as the implicit system folder.
+            # This preserves the old behavior where "all-stars" worked even
+            # without a row in virtual_folders.
+            if row is None:
+                if folder_id == "all-stars":
+                    repos = await self._get_all_stars(db)
+                    await self._hydrate_user_tags(db, repos)
+                    return repos
+                return []
 
-            return [StarredRepo.from_dict(dict(row)) for row in rows]
+            kind = row["kind"]
+            auto_tags_raw = row["auto_tags"]
+
+            if kind == "system":
+                if folder_id == "all-stars":
+                    repos = await self._get_all_stars(db)
+                else:
+                    raise CacheError(f"Unknown system folder id: {folder_id!r}")
+            elif kind == "rule":
+                repos = await self._get_repos_matching_auto_tags(db, auto_tags_raw)
+            elif kind == "curated":
+                repos = await self._get_curated_folder_repos(db, folder_id)
+            elif kind == "hybrid":
+                repos = await self._get_hybrid_folder_repos(
+                    db, folder_id, auto_tags_raw
+                )
+            else:
+                # Defensive: should be impossible given the migration's enum
+                # restriction, but worth a clear error rather than silent empty.
+                raise CacheError(f"Unknown folder kind: {kind!r}")
+
+            await self._hydrate_user_tags(db, repos)
+            return repos
+
+    @staticmethod
+    async def _get_all_stars(db: aiosqlite.Connection) -> List[StarredRepo]:
+        """Return all starred repos ordered by stars_count DESC."""
+        cursor = await db.execute(
+            "SELECT * FROM starred_repos ORDER BY stars_count DESC"
+        )
+        rows = await cursor.fetchall()
+        return [StarredRepo.from_dict(dict(row)) for row in rows]
+
+    @staticmethod
+    async def _get_repos_matching_auto_tags(
+        db: aiosqlite.Connection, auto_tags_raw: Optional[str]
+    ) -> List[StarredRepo]:
+        """Return repos whose ``topics`` intersect with the folder's auto_tags.
+
+        Topics are stored as JSON-encoded lists in ``starred_repos.topics``;
+        we use SQLite's ``LIKE`` against the JSON fragment ``"<tag>"`` (with
+        quotes) so we don't false-match on substrings of other tags.
+        Language is also matched as a special case for parity with
+        ``VirtualFolder.matches_repo``.
+        """
+        import json
+
+        if not auto_tags_raw:
+            return []
+        try:
+            tags = json.loads(auto_tags_raw)
+        except (TypeError, ValueError):
+            return []
+        if not tags:
+            return []
+
+        # Build dynamic OR query — one clause per tag for either topics
+        # JSON-substring match or language equality.
+        topic_clauses = []
+        params: List[Any] = []
+        for tag in tags:
+            tag_lower = tag.lower()
+            # JSON list serialization always wraps strings in double quotes,
+            # so ``"<tag>"`` is a safe substring marker that won't false-match.
+            topic_clauses.append("LOWER(topics) LIKE ?")
+            params.append(f'%"{tag_lower}"%')
+            topic_clauses.append("LOWER(language) = ?")
+            params.append(tag_lower)
+
+        where = " OR ".join(topic_clauses)
+        cursor = await db.execute(
+            f"SELECT * FROM starred_repos WHERE {where} ORDER BY stars_count DESC",
+            params,
+        )
+        rows = await cursor.fetchall()
+        return [StarredRepo.from_dict(dict(row)) for row in rows]
+
+    @staticmethod
+    async def _get_curated_folder_repos(
+        db: aiosqlite.Connection, folder_id: str
+    ) -> List[StarredRepo]:
+        """Repos in folder_repos for this folder, ordered by position then stars."""
+        cursor = await db.execute(
+            """
+            SELECT r.* FROM starred_repos r
+            JOIN folder_repos fr ON r.id = fr.repo_id
+            WHERE fr.folder_id = ?
+            ORDER BY
+                CASE WHEN fr.position IS NULL THEN 1 ELSE 0 END,
+                fr.position ASC,
+                r.stars_count DESC
+            """,
+            (folder_id,),
+        )
+        rows = await cursor.fetchall()
+        return [StarredRepo.from_dict(dict(row)) for row in rows]
+
+    @classmethod
+    async def _get_hybrid_folder_repos(
+        cls,
+        db: aiosqlite.Connection,
+        folder_id: str,
+        auto_tags_raw: Optional[str],
+    ) -> List[StarredRepo]:
+        """Manual-linked first (by position), then auto-tag matches not already manual.
+
+        Dedup by repo id — a repo that is BOTH manually linked AND
+        auto-tag-matched appears once, with the manual ordering preserved.
+        """
+        manual = await cls._get_curated_folder_repos(db, folder_id)
+        manual_ids = {r.id for r in manual}
+        auto = await cls._get_repos_matching_auto_tags(db, auto_tags_raw)
+        # Filter out duplicates already covered by manual; preserve auto's
+        # stars-DESC ordering for the remainder.
+        deduped_auto = [r for r in auto if r.id not in manual_ids]
+        return manual + deduped_auto
 
     async def add_repo_to_folder(
         self, repo_id: str, folder_id: str, is_manual: bool = True
@@ -821,6 +1016,167 @@ class PersistentCache:
                 (folder_id, repo_id),
             )
             await db.commit()
+
+    async def set_folder_repo_position(
+        self, folder_id: str, repo_id: str, position: int
+    ) -> None:
+        """Set the position for a single (folder, repo) link.
+
+        Caller is responsible for ensuring the folder kind permits ordering
+        (curated/hybrid). Cache layer does not validate kind here because
+        bulk reorder operations would otherwise need to re-fetch the folder
+        on every call; the service layer (folder_manager.reorder_folder_repos)
+        is the authoritative gate.
+        """
+        async with self._connect() as db:
+            await db.execute(
+                """
+                UPDATE folder_repos SET position = ?
+                WHERE folder_id = ? AND repo_id = ?
+                """,
+                (position, folder_id, repo_id),
+            )
+            await db.commit()
+
+    async def reorder_folder_repos(
+        self, folder_id: str, ordered_repo_ids: List[str]
+    ) -> None:
+        """Assign positions 0..N-1 to the given repo_ids in order.
+
+        Repos not present in the list keep their existing position. This is
+        intentional: the TUI usually only touches the visible window, not the
+        full folder. Use ``set_folder_repo_position`` for individual swaps.
+        """
+        rows = [(idx, folder_id, repo_id) for idx, repo_id in enumerate(ordered_repo_ids)]
+        if not rows:
+            return
+        async with self._connect() as db:
+            await db.executemany(
+                """
+                UPDATE folder_repos SET position = ?
+                WHERE folder_id = ? AND repo_id = ?
+                """,
+                rows,
+            )
+            await db.commit()
+
+    # ==================== User Tags Operations ====================
+
+    @staticmethod
+    def _normalize_tag(tag: str) -> str:
+        """Lowercase + strip a single tag. Raises CacheError if empty after.
+
+        Tag identity is case-insensitive: ``Python`` and ``python`` are the
+        same tag. The (repo_id, tag) PRIMARY KEY enforces this once we
+        normalize at write time.
+        """
+        if not isinstance(tag, str):
+            raise CacheError(f"Tag must be a string, got {type(tag).__name__}")
+        normalized = tag.strip().lower()
+        if not normalized:
+            raise CacheError("Tag cannot be empty or whitespace-only")
+        return normalized
+
+    async def add_user_tag(self, repo_id: str, tag: str) -> None:
+        """Add a single tag to a repo. Idempotent on (repo_id, tag) PK."""
+        normalized = self._normalize_tag(tag)
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO user_tags (repo_id, tag, added_at)
+                VALUES (?, ?, ?)
+                """,
+                (repo_id, normalized, datetime.now().isoformat()),
+            )
+            await db.commit()
+
+    async def remove_user_tag(self, repo_id: str, tag: str) -> None:
+        """Remove a single tag from a repo. No-op if not present."""
+        normalized = self._normalize_tag(tag)
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM user_tags WHERE repo_id = ? AND tag = ?",
+                (repo_id, normalized),
+            )
+            await db.commit()
+
+    async def set_user_tags(self, repo_id: str, tags: List[str]) -> None:
+        """Replace all tags on a repo atomically.
+
+        Empty/whitespace tags are rejected; duplicates (after normalization)
+        collapse silently.
+        """
+        normalized = []
+        seen = set()
+        for tag in tags:
+            n = self._normalize_tag(tag)
+            if n not in seen:
+                normalized.append(n)
+                seen.add(n)
+
+        now = datetime.now().isoformat()
+        rows = [(repo_id, tag, now) for tag in normalized]
+
+        async with self._connect() as db:
+            await db.execute("BEGIN")
+            try:
+                await db.execute(
+                    "DELETE FROM user_tags WHERE repo_id = ?", (repo_id,)
+                )
+                if rows:
+                    await db.executemany(
+                        "INSERT INTO user_tags (repo_id, tag, added_at) VALUES (?, ?, ?)",
+                        rows,
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def get_user_tags(self, repo_id: str) -> List[str]:
+        """Return tags for a single repo, sorted alphabetically."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT tag FROM user_tags WHERE repo_id = ? ORDER BY tag ASC",
+                (repo_id,),
+            )
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+    async def list_all_tags(self) -> Dict[str, int]:
+        """Return tag -> usage count, sorted by tag name in the dict order."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT tag, COUNT(*) FROM user_tags GROUP BY tag ORDER BY tag ASC"
+            )
+            rows = await cursor.fetchall()
+            return {row[0]: row[1] for row in rows}
+
+    async def _hydrate_user_tags(
+        self,
+        db: aiosqlite.Connection,
+        repos: List[StarredRepo],
+    ) -> None:
+        """Bulk-fetch user_tags for the given repos and assign in place.
+
+        Uses one keyed query keyed by repo_id (not GROUP_CONCAT — empty or
+        forbidden delimiters are too easy to get wrong; one extra round-trip
+        for the rare case of a populated user_tags table is fine).
+        """
+        if not repos:
+            return
+        ids = [r.id for r in repos]
+        placeholders = ",".join("?" for _ in ids)
+        cursor = await db.execute(
+            f"SELECT repo_id, tag FROM user_tags WHERE repo_id IN ({placeholders}) ORDER BY tag ASC",
+            ids,
+        )
+        rows = await cursor.fetchall()
+        bucket: Dict[str, List[str]] = {repo_id: [] for repo_id in ids}
+        for repo_id, tag in rows:
+            bucket[repo_id].append(tag)
+        for repo in repos:
+            repo.user_tags = bucket.get(repo.id, [])
 
     # ==================== Repo Metadata Operations ====================
 

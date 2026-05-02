@@ -817,38 +817,34 @@ class GangerApp(App):
             )
 
     async def on_folder_created(self, message: FolderCreated) -> None:
-        """Handle folder creation."""
+        """Handle folder creation. Routes through folder_manager so the
+        kind/auto_tags validation rules apply (Codex finding #7)."""
         try:
             if not self.folder_manager:
                 return
 
-            # Create folder ID from name
-            folder_id = message.name.lower().replace(" ", "-")
-
-            # Create virtual folder
-            folder = VirtualFolder(
-                id=folder_id,
+            # Folders created from the TUI today don't yet have a kind
+            # selector (slice 7 adds one). Until then, infer from auto_tags:
+            # any tags -> rule, otherwise -> curated. The folder_manager
+            # validation does the same fallback.
+            folder = await self.folder_manager.create_folder(
                 name=message.name,
-                auto_tags=message.auto_tags,
-                repo_count=0,
+                auto_tags=message.auto_tags or [],
+                description=getattr(message, "description", "") or "",
             )
 
-            await self.cache.create_virtual_folder(folder)
-
-            # Auto-categorize if tags provided
-            if message.auto_tags and self.settings.behavior.auto_categorize:
-                # Get all repos and categorize into this folder
+            # Auto-categorize if tags provided. The folder_manager's
+            # auto_categorize_repo will only act on rule/hybrid kinds.
+            if folder.auto_tags and self.settings.behavior.auto_categorize:
                 all_repos = await self.cache.get_starred_repos()
                 if all_repos:
                     for repo in all_repos:
-                        # Check if repo matches folder tags
-                        if folder.auto_tags and repo.topics:
-                            if any(tag in repo.topics for tag in folder.auto_tags):
-                                await self.cache.add_repo_to_folder(
-                                    repo_id=repo.id,
-                                    folder_id=folder.id,
-                                    is_manual=False
-                                )
+                        if folder.matches_repo(repo):
+                            await self.cache.add_repo_to_folder(
+                                repo_id=repo.id,
+                                folder_id=folder.id,
+                                is_manual=False,
+                            )
 
             # Refresh folders
             await self.load_folders()
