@@ -520,17 +520,37 @@ class PersistentCache:
         )
 
     async def upsert_starred_repos(self, repos: List[StarredRepo]) -> None:
-        """Insert or update a batch of cached starred repos without pruning."""
+        """Insert or update a batch of cached starred repos without pruning.
+
+        Stub identity-upgrade: if any inbound repo has a ``full_name`` that
+        already maps to an ``is_stub=1`` row with a different id, the stub is
+        upgraded (id replaced, ``folder_repos`` and ``user_tags`` references
+        reparented) before the regular upsert runs. This catches the case
+        where a user imports a list referencing a repo they hadn't yet
+        starred — the stub is created at import time and replaced here when
+        the real GitHub id arrives.
+        """
         async with self._connect() as db:
+            await self._upgrade_stubs_for_batch(db, repos)
             await self._upsert_starred_repos(db, repos)
             await db.commit()
 
     async def prune_starred_repos(self, keep_repo_ids: Iterable[str]) -> None:
-        """Delete cached repos not present in the provided snapshot."""
+        """Delete cached repos not present in the provided snapshot.
+
+        ``is_stub=1`` rows are always preserved — they represent imports
+        referencing repos the user hasn't actually starred yet, and must
+        survive prune until the next sync upgrades them in place. This is
+        why the SELECT and the bulk-delete branch both filter on
+        ``is_stub = 0``.
+        """
         async with self._connect() as db:
             keep_repo_ids = tuple(dict.fromkeys(keep_repo_ids))
 
-            cursor = await db.execute("SELECT id FROM starred_repos")
+            # Only consider non-stub rows as candidates for deletion.
+            cursor = await db.execute(
+                "SELECT id FROM starred_repos WHERE is_stub = 0"
+            )
             existing_repo_ids = {row[0] for row in await cursor.fetchall()}
             stale_repo_ids = existing_repo_ids - set(keep_repo_ids)
 
@@ -542,10 +562,172 @@ class PersistentCache:
                     tuple(stale_repo_ids),
                 )
             elif not keep_repo_ids:
-                await db.execute("DELETE FROM starred_repos")
-                await db.execute("DELETE FROM repo_metadata")
+                # Wipe non-stubs only. Stubs and their metadata survive.
+                cursor = await db.execute(
+                    "SELECT id FROM starred_repos WHERE is_stub = 0"
+                )
+                victims = [row[0] for row in await cursor.fetchall()]
+                if victims:
+                    await self._delete_repo_metadata(db, victims)
+                    await db.execute(
+                        "DELETE FROM starred_repos WHERE is_stub = 0"
+                    )
 
             await db.commit()
+
+    @staticmethod
+    async def _upgrade_stubs_for_batch(
+        db: aiosqlite.Connection,
+        repos: List[StarredRepo],
+    ) -> None:
+        """For each inbound repo whose ``full_name`` matches a stub row with
+        a different id, upgrade the stub in place.
+
+        Two cases per inbound repo R with full_name F and id I_real:
+          1. Stub S exists (id=I_stub, full_name=F, is_stub=1) and no row
+             with id=I_real exists. **Identity upgrade:** rename S's id
+             to I_real and clear is_stub. Reparent ``folder_repos`` and
+             ``user_tags`` references in the same transaction.
+          2. Stub S exists AND a separate real row R' with id=I_real
+             also exists (e.g. user starred I_real long before the import,
+             then someone imported a list referencing F). **Collision
+             merge:** the real row wins. Reparent S's children to I_real
+             with INSERT OR IGNORE (deduped on the natural PK), then
+             DELETE S.
+
+        FK semantics: ``folder_repos.repo_id`` and ``user_tags.repo_id``
+        cascade on DELETE but have no ``ON UPDATE`` action. With
+        ``foreign_keys=ON``, plain UPDATEs on the parent PK violate the
+        constraint mid-transaction (children orphaned momentarily).
+        ``PRAGMA defer_foreign_keys=ON`` defers FK checks until commit
+        time, which makes the multi-row update legal. The pragma is
+        transaction-scoped — committing resets it to OFF automatically.
+        """
+        if not repos:
+            return
+
+        # Find stubs by full_name in the inbound batch.
+        full_names = [r.full_name for r in repos]
+        placeholders = ",".join("?" for _ in full_names)
+        cursor = await db.execute(
+            f"""
+            SELECT id, full_name FROM starred_repos
+            WHERE full_name IN ({placeholders}) AND is_stub = 1
+            """,
+            full_names,
+        )
+        stubs = {row[1]: row[0] for row in await cursor.fetchall()}
+        if not stubs:
+            return
+
+        # For each match, plan the operation: upgrade or collision-merge.
+        # Build the work list outside the transaction to keep it short.
+        plans = []  # (stub_id, new_id, mode) where mode in {"upgrade","merge"}
+        for repo in repos:
+            stub_id = stubs.get(repo.full_name)
+            if stub_id is None or stub_id == repo.id:
+                continue
+            # Check whether the new id already exists as a separate row.
+            cursor = await db.execute(
+                "SELECT 1 FROM starred_repos WHERE id = ?", (repo.id,)
+            )
+            real_exists = (await cursor.fetchone()) is not None
+            plans.append((stub_id, repo.id, "merge" if real_exists else "upgrade"))
+
+        if not plans:
+            return
+
+        # Single transaction with deferred FK checks.
+        await db.execute("BEGIN")
+        try:
+            await db.execute("PRAGMA defer_foreign_keys = ON")
+            for stub_id, new_id, mode in plans:
+                if mode == "upgrade":
+                    # Parent first (PK rename), then children. Order doesn't
+                    # matter under defer_foreign_keys; we pick parent-first
+                    # for clarity.
+                    await db.execute(
+                        "UPDATE starred_repos SET id = ?, is_stub = 0 WHERE id = ?",
+                        (new_id, stub_id),
+                    )
+                    await db.execute(
+                        "UPDATE folder_repos SET repo_id = ? WHERE repo_id = ?",
+                        (new_id, stub_id),
+                    )
+                    await db.execute(
+                        "UPDATE user_tags SET repo_id = ? WHERE repo_id = ?",
+                        (new_id, stub_id),
+                    )
+                else:  # mode == "merge"
+                    # Reparent stub's children onto the existing real row.
+                    # INSERT OR IGNORE handles the natural-PK dedup
+                    # (folder_id, repo_id) and (repo_id, tag).
+                    await db.execute(
+                        """
+                        INSERT OR IGNORE INTO folder_repos
+                            (folder_id, repo_id, is_manual, added_at, position)
+                        SELECT folder_id, ?, is_manual, added_at, position
+                          FROM folder_repos WHERE repo_id = ?
+                        """,
+                        (new_id, stub_id),
+                    )
+                    await db.execute(
+                        "DELETE FROM folder_repos WHERE repo_id = ?", (stub_id,)
+                    )
+                    await db.execute(
+                        """
+                        INSERT OR IGNORE INTO user_tags (repo_id, tag, added_at)
+                        SELECT ?, tag, added_at
+                          FROM user_tags WHERE repo_id = ?
+                        """,
+                        (new_id, stub_id),
+                    )
+                    await db.execute(
+                        "DELETE FROM user_tags WHERE repo_id = ?", (stub_id,)
+                    )
+                    # Stub row is now childless; safe to delete.
+                    await db.execute(
+                        "DELETE FROM starred_repos WHERE id = ?", (stub_id,)
+                    )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+    async def insert_stub(
+        self, full_name: str, name: Optional[str] = None, owner: Optional[str] = None
+    ) -> str:
+        """Insert a placeholder row for a repo referenced by an import but
+        not yet present. The id is set to ``full_name`` so subsequent
+        upserts (with the real GitHub id) can locate the stub via the
+        ``full_name`` UNIQUE constraint and run the identity-upgrade path.
+
+        Returns the stub id (which equals ``full_name``).
+        """
+        if not full_name:
+            raise CacheError("insert_stub requires non-empty full_name")
+        if "/" in full_name and (name is None or owner is None):
+            o, n = full_name.split("/", 1)
+            owner = owner or o
+            name = name or n
+        elif name is None or owner is None:
+            raise CacheError(
+                f"insert_stub({full_name!r}): cannot derive owner/name "
+                "without a slash; pass them explicitly"
+            )
+        stub_id = full_name
+        now = datetime.now().isoformat()
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO starred_repos
+                    (id, full_name, name, owner, cached_at, is_stub)
+                VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                (stub_id, full_name, name, owner, now),
+            )
+            await db.commit()
+        return stub_id
 
     @staticmethod
     async def _upsert_starred_repos(
