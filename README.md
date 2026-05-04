@@ -1,4 +1,4 @@
-<img src=assets/logo.png width=50%>
+<img src=assets/logo.png width=65%>
 <!-- # Ganger - GitHub Ranger -->
 
 **Created**: 2025-11-07
