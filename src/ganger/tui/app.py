@@ -81,7 +81,10 @@ class GangerApp(App):
         Binding("ctrl+q", "force_quit", "Force Quit", show=False),
     ]
 
-    # Note: gn (create folder) and gd (delete folder) are handled in on_key() as double-key commands
+    # Keys that open a two-key ranger chord (gg, gn, gd, dd, yy, pp).
+    # Adding a key here that is ALSO in BINDINGS requires `_consume_key`'s
+    # prevent_default: arming the prefix would otherwise fire the binding too.
+    _CHORD_PREFIXES = frozenset({"g", "d", "y", "p"})
 
     # Reactive attributes
     show_help = reactive(False)
@@ -974,51 +977,98 @@ class GangerApp(App):
             logger.error(f"Error handling ranger command '{message.command}': {e}", exc_info=True)
             self.notify(f"Error: {e}", severity="error")
 
+    def _consume_key(self, event: events.Key) -> None:
+        """Fully consume a key event so no binding also fires for it.
+
+        `event.stop()` alone is not enough here. It only halts bubbling to a parent,
+        and this App is the root of the chain. `App._on_key` — which runs
+        `check_bindings()` — is dispatched from the same MRO walk as this handler and
+        ignores `_stop_propagation`; only `prevent_default()` sets `_no_default_action`,
+        which is what actually breaks that loop. Priority bindings (`q`) are checked
+        before the key is forwarded here at all, so they can never be consumed.
+        """
+        event.prevent_default()
+        event.stop()
+
+    async def _dispatch_chord(self, chord: str) -> bool:
+        """Run a two-key ranger chord.
+
+        Returns True if the chord is *recognized* — not whether it did anything. A
+        recognized chord whose context guard declines (e.g. `gd` outside the folder
+        column) is still recognized, so the caller must not report it as unimplemented.
+        """
+        if chord == "gg":
+            if self.miller_view:
+                if self.miller_view.focused_column == 0 and self.miller_view.folder_column:
+                    self.miller_view.folder_column.select_first()
+                elif self.miller_view.focused_column == 1 and self.miller_view.repo_column:
+                    self.miller_view.repo_column.select_first()
+        elif chord == "gn":
+            await self.action_create_folder()
+        elif chord == "gd":
+            if self.miller_view and self.miller_view.focused_column == 0:
+                await self.action_delete_folder()
+            else:
+                # Recognized, but not applicable here. Saying nothing would re-create the
+                # silent swallow this whole change exists to remove.
+                self.notify("gd: only in the folder column", timeout=2)
+        elif chord == "dd":
+            self.post_message(RangerCommand("cut"))
+        elif chord == "yy":
+            self.post_message(RangerCommand("copy"))
+        elif chord == "pp":
+            self.post_message(RangerCommand("paste"))
+        else:
+            return False
+        return True
+
     async def on_key(self, event: events.Key) -> None:
         """Handle keyboard events."""
+        # Chords and navigation belong to the base screen. Textual scopes *bindings* to
+        # the active screen but not *handlers*, so keys still bubble here from a pushed
+        # modal — without this guard, `gn` inside the folder-creation modal opens a
+        # second one, and `dd` mutates the clipboard behind it. (Depth, not `self.screen`,
+        # which raises ScreenStackError before the app is mounted.)
+        if len(self.screen_stack) > 1:
+            # A modal owns the keyboard, so drop any half-typed chord. Without this, a
+            # prefix armed before the modal opened would survive it and the first key
+            # afterwards would complete the chord — the same bug, across a screen boundary.
+            self._pending_command = None
+            return
+
+        # A live chord prefix owns the next keystroke and is cleared on *every* path.
+        # The navigation branch below used to return early without clearing it, so a
+        # stale prefix desynchronized every chord that followed: after `d`,`j` a single
+        # `d` completed `dd` (cut), and `gg` needed a third `g`.
+        if self._pending_command:
+            chord = self._pending_command + event.key
+            self._pending_command = None
+
+            if await self._dispatch_chord(chord):
+                self._consume_key(event)
+                return
+
+            if chord in registry.keybindings:
+                # Advertised in the help overlay but not implemented. Say so, rather
+                # than swallowing the keystroke with no feedback at all.
+                self.notify(f"{chord}: not yet implemented", timeout=2)
+                self._consume_key(event)
+                return
+
+            # Not a chord at all (`dj`, `descape`, `dquestion_mark`): fall through, so
+            # the key keeps whatever meaning it would have had on its own.
+
         # Let MillerView handle navigation keys
         if self.miller_view:
             handled = await self.miller_view.handle_navigation(event.key)
             if handled:
-                event.stop()
+                self._consume_key(event)
                 return
 
-        # Handle ranger double-key commands (gg, dd, yy, pp, etc.)
-        if self._pending_command:
-            command = self._pending_command + event.key
-            self._pending_command = None
-
-            if command == "gg":
-                # Jump to top
-                if self.miller_view:
-                    if self.miller_view.focused_column == 0 and self.miller_view.folder_column:
-                        self.miller_view.folder_column.select_first()
-                    elif self.miller_view.focused_column == 1 and self.miller_view.repo_column:
-                        self.miller_view.repo_column.select_first()
-            elif command == "gn":
-                # Create new folder
-                await self.action_create_folder()
-            elif command == "gd":
-                # Delete folder (only if in folder column and folder is empty)
-                if self.miller_view and self.miller_view.focused_column == 0:
-                    await self.action_delete_folder()
-            elif command == "dd":
-                # Cut repos
-                self.post_message(RangerCommand("cut"))
-            elif command == "yy":
-                # Copy repos
-                self.post_message(RangerCommand("copy"))
-            elif command == "pp":
-                # Paste repos
-                self.post_message(RangerCommand("paste"))
-
-            event.stop()
-            return
-
         # Check for first key of double-key commands
-        if event.key in ["g", "d", "y", "p"]:
+        if event.key in self._CHORD_PREFIXES:
             self._pending_command = event.key
-            event.stop()
+            self._consume_key(event)
             return
 
 

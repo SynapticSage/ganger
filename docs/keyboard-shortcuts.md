@@ -10,7 +10,9 @@ expect yet.
 
 ## Conventions
 
-- A pair like `gg` means "press `g`, then `g`". Don't release between.
+- A pair like `gg` means "press `g`, then `g`" — one after the other. There is no
+  timing or hold requirement, and no timeout: the first key arms the pair and the
+  very next keystroke completes it.
 - A pair like `Ctrl+R` means hold `Ctrl` while pressing `R`.
 - Lowercase vs uppercase letters are different keys (`v` ≠ `V`).
 - Bindings are scoped to a column (the active focus). `j/k` in the folder
@@ -36,8 +38,8 @@ expect yet.
 | `k` | Move up one item |
 | `l` | Move focus to the column on the right (or enter a folder) |
 | `gg` | Jump to the first item in the current column |
-| `G` | Jump to the last item in the current column |
-| `Enter` | Select the current item (open folder / focus repo) |
+| `G` | Jump to the last item in the current column (*not yet wired*) |
+| `Enter` | Select the current item (open folder / focus repo) (*not yet wired*) |
 
 `h` and `l` form the cross-column traversal: `l` from the folder column
 loads the folder's repos in the middle column; `l` from the repo column
@@ -54,7 +56,7 @@ Marks are independent of focus — focus follows `j/k`, marks toggle with
 | `Space` | Toggle the mark on the focused repo |
 | `V` | Visual mode (range selection — *not yet wired*) |
 | `v` | Invert the current selection (*not yet wired*) |
-| `uv` | Unmark all repos |
+| `uv` | Unmark all repos (*not yet wired*) |
 
 If you trigger an operation (cut/copy/paste) with no marks set, it acts
 on the focused repo only.
@@ -111,21 +113,25 @@ Search filters folders and repos by name and description in real time.
 
 | Key | Action |
 |---|---|
-| `gb` | Open the focused repo in your browser |
+| `gb` | Open the focused repo in your browser (*not yet wired*) |
 | `gc` | Clone the repo (*coming soon*) |
 | `gi` | View open issues (*coming soon*) |
 | `gp` | View open pull requests (*coming soon*) |
-| `gr` | View the README in the preview pane |
-| `gf` | Refresh metadata for this repo |
+| `gr` | View the README in the preview pane (*not yet wired*) |
+| `gf` | Refresh metadata for this repo (*not yet wired*) |
 | `gs` | Toggle star/unstar (*coming soon*) |
-| `gR` | Refresh all repos (same as `Ctrl+Shift+R`) |
+| `gR` | Refresh all repos (same as `Ctrl+Shift+R`) (*not yet wired* — use `Ctrl+Shift+R`) |
+
+Every key in this table that is marked *not yet wired* now tells you so: pressing it
+pops a "`gb`: not yet implemented" toast rather than doing nothing. They are being
+wired in roadmap items G1/G2.
 
 ## Tags
 
 | Key | Action |
 |---|---|
 | `gt` | Manage user tags on the focused repo (*coming in slice 3*) |
-| `ga` | Auto-categorize all repos by language/topic |
+| `ga` | Auto-categorize all repos by language/topic (*not yet wired*) |
 
 `gt` will open a tag-management modal once slice 3 ships. Until then,
 the tag database is reachable through `:tag` / `:untag` and the cache
@@ -136,7 +142,7 @@ without the UI.
 
 | Key | Action |
 |---|---|
-| `ga` | Re-run auto-categorization across `kind ∈ {rule, hybrid}` folders |
+| `ga` | Re-run auto-categorization across `kind ∈ {rule, hybrid}` folders (*not yet wired*) |
 
 Auto-categorization scans every folder whose `kind` is `rule` or `hybrid`
 and adds any starred repos that match the folder's `auto_tags`. Curated
