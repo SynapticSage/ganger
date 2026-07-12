@@ -69,3 +69,6 @@ temp/
 
 # Codex skill state (pane ID, session ID, transient prompts)
 .context/
+
+# Run journal — internal engineering notes, kept local (this repo is public)
+journal/
