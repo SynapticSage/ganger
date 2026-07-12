@@ -1,7 +1,7 @@
 # GitHub Ranger (ganger) — Roadmap
 
 Status: **Phase 2B complete** (solid, tested backend — versioned cache, folder
-kinds, user tags, MCP server, 262 passing tests) with a **TUI that is ~70%
+kinds, user tags, MCP server, **279 passing tests**) with a **TUI that is ~70%
 stubbed and over-advertised**. This roadmap was synthesized (2026-07-09) from a
 two-agent cross-repo study against its sibling **yanger** (YouTube Ranger), which
 shares ganger's lineage and has already debugged much of what ganger is about to
@@ -105,7 +105,9 @@ and UX fixes, *then* the foundational tech-debt yanger's roadmap already mapped.
 - **G1 · Wire the `:` command palette.** `[B1]` Only `:quit`/`:help` work;
   everything else hits the `:718` "not yet implemented" fallthrough. Start with
   commands whose backends already exist: `:refresh`, `:cache`, `:stats`, `:auto`
-  (auto-categorize), `:rate`. **Blocked on G0.** *Impact High (trust) · Effort M.*
+  (auto-categorize), `:rate`. G0 (its state machine) has shipped; **do GQ first** — it is
+  one line, and G1 only adds more typing surface to that data-loss bug.
+  *Impact High (trust) · Effort M.*
   - **Architecture (ruled 2026-07-12):** do **not** populate the `Command.handler`
     field — `keybindings.py:356` is an import-time singleton, and binding app
     methods into it leaks a `GangerApp` across the multiple app instances the tests
@@ -235,7 +237,7 @@ and UX fixes, *then* the foundational tech-debt yanger's roadmap already mapped.
 
 ## Changelog (newest first)
 
-- **G0 · Repaired the chord-prefix state machine.** `1dab92f` (2026-07-12) —
+- **G0 · Repaired the chord-prefix state machine.** `b61e8fd` (2026-07-12) —
   `on_key` delegated to `miller_view.handle_navigation()` *before* checking
   `_pending_command`, and the handled path returned early **without clearing the
   prefix**. A stale prefix therefore survived a navigation key and desynchronized every
